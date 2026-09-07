@@ -910,7 +910,7 @@ export default definePlugin({
     description:
         "After Discord starts capturing a screenshare source, offers to route only one app's audio into the " +
         "stream (via patchcord/PipeWire) instead of your whole system's default audio output.",
-    authors: [{ name: "jehuang", id: 0n }],
+    authors: [{ name: "pendo324", id: 95301288748658688n }],
     settings,
 
     // As early as possible: Discord's own webpack code apparently grabs a
