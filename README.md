@@ -80,12 +80,18 @@ git checkout patchcordAppAudio
 pnpm install
 ```
 
-### 2. This plugin
+### 2. Add this plugin
 
-Copy this folder into `src/userplugins/patchcordAppAudio/` in that
-Equicord checkout (userplugins are gitignored by Equicord convention,
-which is why this lives in a separate repo rather than being part of the
-Equicord fork itself).
+Userplugins are gitignored by Equicord convention (which is why this
+lives in a separate repo rather than being part of the Equicord fork
+itself) -- copy it into your checkout manually:
+
+```sh
+git clone https://github.com/pendo324/patchcordAppAudio
+mkdir -p src/userplugins
+cp -r patchcordAppAudio src/userplugins/patchcordAppAudio
+rm -rf src/userplugins/patchcordAppAudio/.git
+```
 
 ### 3. `patchcord` binary
 
@@ -101,18 +107,65 @@ build with `cargo build --release`, and place the resulting binary at
 before enabling the plugin -- it will detect the existing file's
 checksum and skip the download/consent prompt for that asset.
 
-### 4. Build and install Equicord
+### 4. Build Equicord and inject it into Discord
+
+This step turns your source checkout into an actual patch applied to
+your installed Discord client. If you've never done this before, follow
+it exactly.
+
+**a. Build the JS/CSS bundle.** This compiles `src/` (including the
+core patch from step 1 and the plugin from step 2) into `dist/desktop/`,
+which is what actually gets injected -- nothing from the previous steps
+takes effect until this runs:
 
 ```sh
 cd Equicord
 pnpm build
 ```
 
-Then inject into your Discord install per Equicord's normal dev-install
-flow (`pnpm inject`, or set `EQUICORD_DEV_INSTALL`/`EQUICORD_DIRECTORY`
-per Equicord's own docs). Linux native Discord only -- this plugin
-no-ops everywhere else (`IS_DISCORD_DESKTOP && process.platform ===
-"linux"` gate in `start()`).
+Takes a few seconds. You should see `dist/desktop/patcher.js`,
+`renderer.js`, `preload.js`, etc. get written.
+
+**b. Close Discord completely** if it's running. Injecting into a
+running instance doesn't work -- quit it from the tray icon or
+`killall Discord`, don't just close the window.
+
+**c. Run the injector:**
+
+```sh
+pnpm inject
+```
+
+The first time you run this, it downloads Equicord's own installer tool
+(`EquilotlCli`) automatically -- that's expected, a one-time download.
+It then launches an **interactive terminal menu**:
+
+- It auto-detects installed Discord clients (Stable/PTB/Canary/etc.) and
+  lists them.
+- Use arrow keys to select your Discord install, press Enter.
+- It'll ask whether to install -- confirm yes.
+- It patches Discord's `app.asar` to load your local `dist/desktop`
+  build instead of the stock one. This is a live link, not a one-time
+  copy: any time you `pnpm build` again later (e.g. after pulling plugin
+  updates), just reopening Discord picks up the new build automatically
+  -- no need to re-run `pnpm inject` unless you're switching which
+  Discord install is patched.
+
+If the menu doesn't show your Discord install, it's probably in a
+nonstandard location -- the tool has a manual "custom install path"
+option in the same menu.
+
+**d. Open Discord normally.** You should see `Equicord` log lines in
+Discord's DevTools console (`Ctrl+Shift+I`) on startup. The plugin will
+be listed and toggleable under **Discord Settings > Equicord > Plugins >
+PatchcordAppAudio**.
+
+Linux native Discord only -- this plugin no-ops everywhere else
+(`IS_DISCORD_DESKTOP && process.platform === "linux"` gate in
+`start()`).
+
+**To undo everything later:** `pnpm uninject` from the same `Equicord`
+folder (same interactive menu) restores Discord to stock.
 
 ## Usage
 
