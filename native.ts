@@ -107,8 +107,23 @@ function binaryName(): string {
  *   git clone https://github.com/Milkshiift/patchcord && cargo build --release
  * and place the resulting `target/release/patchcord` binary at the path
  * this function computes.
+ *
+ * `PATCHCORD_APP_AUDIO_RELEASE_URL_BASE`, if set, overrides where all
+ * three downloadable assets (patchcord itself, discord-capture-shim.so,
+ * discord-capture-setup) are fetched from -- e.g.
+ * `PATCHCORD_APP_AUDIO_RELEASE_URL_BASE=http://127.0.0.1:8787` while
+ * running `python3 -m http.server 8787` from a local
+ * `target/release`-style directory containing exactly these three
+ * files, named per `binaryName()`/`shimAssetNames()` below. This exists
+ * purely so the whole download-and-install flow (asset naming, fetch,
+ * write, chmod, then discord-capture-setup actually invoked against a
+ * real discord_voice.node) can be exercised end-to-end without a real
+ * GitHub release existing yet -- see this session's chat history for why
+ * that gap mattered (the previous "verification" only tested each piece
+ * in isolation, never the actual fetch() path).
  */
-const PATCHCORD_RELEASE_URL_BASE = "https://github.com/Milkshiift/patchcord/releases/latest/download";
+const DEFAULT_RELEASE_URL_BASE = "https://github.com/Milkshiift/patchcord/releases/latest/download";
+const PATCHCORD_RELEASE_URL_BASE = process.env.PATCHCORD_APP_AUDIO_RELEASE_URL_BASE || DEFAULT_RELEASE_URL_BASE;
 
 /**
  * Downloads a single release asset into `binaryDir()` (creating it if
