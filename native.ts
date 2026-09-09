@@ -71,6 +71,7 @@ import { existsSync, statSync } from "fs";
 import { mkdir, writeFile, chmod, readdir, copyFile } from "fs/promises";
 import { execFile } from "child_process";
 import { promisify } from "util";
+import { createHash } from "crypto";
 
 const execFileAsync = promisify(execFile);
 
@@ -133,6 +134,32 @@ const PATCHCORD_RELEASE_URL_BASE = process.env.PATCHCORD_APP_AUDIO_RELEASE_URL_B
  * are plain files published on the same GitHub release, just with
  * different names, so there's no reason to duplicate the fetch/write
  * logic three times.
+ *
+ * Verifies the downloaded bytes against a `<assetName>.sha256` sidecar
+ * file expected to be published alongside every asset on the same
+ * release (plain text, the hex digest optionally followed by whitespace
+ * and a filename -- the same format `sha256sum` itself produces, so the
+ * release process can just run `sha256sum` over each asset and publish
+ * the output directly). This is deliberately fetched from the *same*
+ * `releaseUrlBase` as the asset itself, not a separate trusted source --
+ * it only protects against corruption/truncation in transit and
+ * mismatched files being served under the wrong name, not against a
+ * fully compromised release host serving both a malicious binary and a
+ * matching malicious checksum. A real defense against a compromised
+ * release host would need out-of-band pinned hashes (e.g. baked into
+ * this plugin's own source and updated per release) or signed releases;
+ * this is a meaningfully weaker guarantee than that, but still catches
+ * the much more likely failure modes (flaky network truncating a
+ * download, a build/publish script bug shipping the wrong file under a
+ * given name) that silently writing and chmod'ing whatever bytes came
+ * back previously did not protect against at all.
+ *
+ * On mismatch, the downloaded bytes are discarded (never written to
+ * `binaryDir()`) and this throws -- callers already handle a thrown
+ * download failure by surfacing an error rather than silently
+ * continuing with something that will only exec into confusing
+ * failures downstream (execFileAsync against a truncated/wrong binary,
+ * a shim .so that fails to load, etc).
  */
 async function downloadAsset(assetName: string, releaseUrlBase: string): Promise<string> {
     const dir = binaryDir();
@@ -141,6 +168,7 @@ async function downloadAsset(assetName: string, releaseUrlBase: string): Promise
 
     await mkdir(dir, { recursive: true });
     const url = `${releaseUrlBase}/${assetName}`;
+    const checksumUrl = `${url}.sha256`;
     console.log("[patchcordAppAudio] Downloading", assetName, "from", url);
 
     let res: Response;
@@ -160,6 +188,32 @@ async function downloadAsset(assetName: string, releaseUrlBase: string): Promise
     }
 
     const buf = Buffer.from(await res.arrayBuffer());
+
+    let checksumRes: Response;
+    try {
+        checksumRes = await fetch(checksumUrl);
+    } catch (e) {
+        throw new Error(
+            `[patchcordAppAudio] Downloaded ${assetName} but failed to fetch its checksum sidecar ` +
+            `(network error): ${(e as Error).message}. Refusing to install an unverified binary.`
+        );
+    }
+    if (!checksumRes.ok) {
+        throw new Error(
+            `[patchcordAppAudio] Downloaded ${assetName} but its checksum sidecar (${checksumUrl}) ` +
+            `returned HTTP ${checksumRes.status}. Refusing to install an unverified binary.`
+        );
+    }
+    const checksumText = await checksumRes.text();
+    const expectedHex = checksumText.trim().split(/\s+/)[0]?.toLowerCase();
+    const actualHex = createHash("sha256").update(buf).digest("hex");
+    if (!expectedHex || expectedHex.length !== 64 || expectedHex !== actualHex) {
+        throw new Error(
+            `[patchcordAppAudio] Checksum mismatch for ${assetName}: expected ${expectedHex ?? "(unparseable)"}, ` +
+            `got ${actualHex}. Refusing to install a binary that doesn't match its published checksum.`
+        );
+    }
+
     await writeFile(file, buf);
     await chmod(file, 0o755);
     return file;
@@ -214,7 +268,7 @@ function shimAssetNames(): { shimSo: string; setupBin: string } {
 
 /**
  * Ensures `discord-capture-shim.so` is downloaded and DT_NEEDED'd into
- * every installed Discord release channel's `discord_voice.node`, using
+ * the *currently running* Discord install's `discord_voice.node`, using
  * `discord-capture-setup` (a small companion binary, see its own doc
  * comment in ~/Code/patchcord/crates/discord-capture-shim/src/bin/setup.rs)
  * instead of shelling out to the system `patchelf` package -- this is
@@ -232,21 +286,27 @@ function shimAssetNames(): { shimSo: string; setupBin: string } {
  * entry (binaryDir() itself) resolves it regardless of which arch build
  * was actually downloaded.
  *
- * Runs `discord-capture-setup` against every discord_voice.node found
- * under any installed Discord release channel's config directory (see
- * findDiscordVoiceNodePaths()), not just the currently-running one --
- * this plugin's own process only knows about the channel it's actually
- * running inside, but the user may switch channels (Stable/PTB/Canary)
- * or Discord may install a new version dir on the next auto-update, and
- * a not-yet-patched discord_voice.node silently means "shim inactive,
- * every detected app leaks through" with no user-visible signal (per
- * this file's own top doc comment) -- so it's much safer to patch every
- * one found than to patch only the one currently in use.
+ * Deliberately scoped to only the Discord install this plugin's own
+ * process is actually running inside (see findCurrentDiscordVoiceNodePaths()),
+ * not every Discord channel found on the machine -- an earlier version
+ * of this scanned and silently patched every discord*-named directory
+ * under the user's config root (Stable, PTB, Canary, whatever else),
+ * which means installing this plugin on one channel would silently
+ * modify native binaries belonging to completely separate Discord
+ * installs the user never opted into touching. Scoping to the running
+ * install trades a small amount of convenience (switching channels
+ * means this needs to run again from within that channel, which it
+ * does automatically on next plugin start) for a plugin that only ever
+ * touches the one Discord install the user is actually running it in --
+ * matching the same reasoning Equicord core itself uses in
+ * hostUpdateHook.ts's own version-dir resolution.
  *
  * Idempotent (discord-capture-setup itself no-ops on an
- * already-patched file), so calling this on every plugin start is safe
- * and cheap; it's also re-run after every Discord auto-update replaces
- * discord_voice.node with a fresh, unpatched copy.
+ * already-patched file, and always keeps a `.discord-capture-setup.orig`
+ * backup of the pre-patch original -- see setup.rs's own doc comment),
+ * so calling this on every plugin start is safe and cheap; it's also
+ * re-run after every Discord auto-update replaces discord_voice.node
+ * with a fresh, unpatched copy.
  */
 async function ensureDiscordCaptureShimInstalled(): Promise<void> {
     if (process.platform !== "linux") return;
@@ -264,9 +324,9 @@ async function ensureDiscordCaptureShimInstalled(): Promise<void> {
         await chmod(shimDest, 0o755);
     }
 
-    const voiceNodePaths = await findDiscordVoiceNodePaths();
+    const voiceNodePaths = await findCurrentDiscordVoiceNodePaths();
     if (voiceNodePaths.length === 0) {
-        console.warn("[patchcordAppAudio] No discord_voice.node found under any Discord config directory; cannot install discord-capture-shim.");
+        console.warn("[patchcordAppAudio] No discord_voice.node found under the running Discord install; cannot install discord-capture-shim.");
         return;
     }
 
@@ -281,62 +341,68 @@ async function ensureDiscordCaptureShimInstalled(): Promise<void> {
 }
 
 /**
- * Discord's own config-directory layout (`~/.config/discord*`,
- * `~/.var/app/com.discordapp.*` for Flatpak) puts each installed
- * version's native modules somewhere under `<configDir>/<version>/
- * modules/` -- but the exact nesting under `modules/` genuinely varies
- * live between installs on this machine: PTB and the Flatpak Canary
- * build have `modules/discord_voice/discord_voice.node` directly, while
- * this machine's Stable install nests one level deeper,
- * `modules/discord_voice-1/discord_voice/discord_voice.node`. Rather
- * than hardcode either shape (and risk silently missing a third one on
- * some other install), this walks the whole `modules/` subtree
- * (bounded depth, modules directories are never more than a couple
- * levels deep) looking for any directory matching `discord_voice(-\d+)?`
- * and then any `discord_voice.node` file anywhere under *that*.
- *
- * Scans every `discord*`-named sibling of the current config dir
- * (covers Stable, PTB, Canary, Development running side-by-side) rather
- * than assuming only the currently-running channel matters (see
- * ensureDiscordCaptureShimInstalled's doc comment for why).
+ * Restores every discord_voice.node this plugin has previously patched
+ * under the currently running Discord install back to its pre-patch
+ * original, using discord-capture-setup's own `--restore` mode (see its
+ * doc comment). Not called automatically anywhere -- exposed as
+ * `restoreDiscordCaptureShim` for the renderer to invoke from a plugin
+ * settings/uninstall action, so a user can cleanly undo the native
+ * patch without needing a full Discord reinstall.
  */
-async function findDiscordVoiceNodePaths(): Promise<string[]> {
-    const configRoot = dirname(app.getPath("userData")); // e.g. ~/.config
-    const found: string[] = [];
-
-    let siblings: string[];
-    try {
-        siblings = await readdir(configRoot);
-    } catch {
-        return found;
+export async function restoreDiscordCaptureShim(_?: Electron.IpcMainInvokeEvent): Promise<void> {
+    if (process.platform !== "linux") return;
+    const { setupBin } = shimAssetNames();
+    const setupPath = join(binaryDir(), setupBin);
+    if (!existsSync(setupPath)) {
+        console.warn("[patchcordAppAudio] discord-capture-setup not found locally; nothing to restore with.");
+        return;
     }
 
-    for (const sibling of siblings) {
-        if (!/discord/i.test(sibling)) continue;
-        const channelDir = join(configRoot, sibling);
-
-        let versionDirs: string[];
+    const voiceNodePaths = await findCurrentDiscordVoiceNodePaths();
+    for (const voiceNodePath of voiceNodePaths) {
         try {
-            versionDirs = await readdir(channelDir);
-        } catch {
-            continue;
-        }
-
-        for (const versionDir of versionDirs) {
-            const modulesDir = join(channelDir, versionDir, "modules");
-            let moduleDirs: string[];
-            try {
-                moduleDirs = await readdir(modulesDir);
-            } catch {
-                continue;
-            }
-            for (const moduleDir of moduleDirs) {
-                if (!/^discord_voice(-\d+)?$/.test(moduleDir)) continue;
-                found.push(...await findVoiceNodeUnder(join(modulesDir, moduleDir), 3));
-            }
+            const { stdout } = await execFileAsync(setupPath, ["--restore", voiceNodePath]);
+            console.log(`[patchcordAppAudio] ${stdout.trim()}`);
+        } catch (e) {
+            console.error(`[patchcordAppAudio] discord-capture-setup --restore failed for ${voiceNodePath}`, e);
         }
     }
+}
 
+/**
+ * Locates `discord_voice.node` under the Discord install this plugin's
+ * own process is actually running inside -- deliberately scoped to just
+ * this one install (see ensureDiscordCaptureShimInstalled's doc comment
+ * for why). `process.execPath`'s directory is the version dir (same
+ * resolution Equicord core's own hostUpdateHook.ts uses for the
+ * identical purpose), so `modules/` is always a direct sibling of the
+ * running executable regardless of which channel/install this is.
+ *
+ * The exact nesting under `modules/` genuinely varies live between
+ * installs on this machine: some have
+ * `modules/discord_voice/discord_voice.node` directly, others nest one
+ * level deeper, `modules/discord_voice-1/discord_voice/discord_voice.node`.
+ * Rather than hardcode either shape, this walks the whole `modules/`
+ * subtree (bounded depth) looking for any directory matching
+ * `discord_voice(-\d+)?` and then any `discord_voice.node` file
+ * anywhere under *that*.
+ */
+async function findCurrentDiscordVoiceNodePaths(): Promise<string[]> {
+    const versionDir = dirname(process.execPath);
+    const modulesDir = join(versionDir, "modules");
+
+    let moduleDirs: string[];
+    try {
+        moduleDirs = await readdir(modulesDir);
+    } catch {
+        return [];
+    }
+
+    const found: string[] = [];
+    for (const moduleDir of moduleDirs) {
+        if (!/^discord_voice(-\d+)?$/.test(moduleDir)) continue;
+        found.push(...await findVoiceNodeUnder(join(modulesDir, moduleDir), 3));
+    }
     return found;
 }
 
