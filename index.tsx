@@ -965,10 +965,12 @@ async function reopenPickerMidStream(triggerBtn?: HTMLButtonElement) {
  * constraint, not something any amount of monkey-patching in this file
  * can work around.
  *
- * The actual patch now lives in Equicord core's preload.ts /
- * discordNativePatch.ts, applied to the real, single, pre-bridge
- * DiscordNative object before contextBridge.exposeInMainWorld ever clones
- * it out. That preload-side patch dispatches a plain `window` CustomEvent
+ * The actual patch now lives in this plugin's own preload.ts (a
+ * top-level plugin preload module, run via Equicord core's generic
+ * per-plugin preload mechanism -- see src/pluginPreloads.ts), applied to
+ * the real, single, pre-bridge DiscordNative object before
+ * contextBridge.exposeInMainWorld ever clones it out. That preload-side
+ * patch dispatches a plain `window` CustomEvent
  * (DiscordNativePatchEvents.ScreenSharePickerResult) whenever the real
  * native picker completes -- ordinary DOM events aren't subject to
  * contextBridge cloning at all, since the DOM/window is one shared tree
@@ -984,7 +986,7 @@ let pickerListenerInstalled = false;
 
 /**
  * Acks the preload-side patch's pending "update" callback hold (see
- * discordNativePatch.ts's waitForPickerAck) so Discord's real stream-start
+ * preload.ts's waitForPickerAck) so Discord's real stream-start
  * proceeds. Always called exactly once per "update" event, whether or not
  * an app-audio target was actually selected -- the ack just means "our
  * decision is made", not "audio routing succeeded".
@@ -1124,7 +1126,7 @@ function unpatchDiscordVoice() {
 
 // Discord's own "New Audio Device Detected" prompt for patchcord's
 // virtual mic is now suppressed at the source in preload
-// (discordNativePatch.ts's patchDeviceChangeCallback filters our virtual
+// (preload.ts's patchDeviceChangeCallback filters our virtual
 // mic out of the device list before Discord's own change-detection logic
 // ever sees it) -- an earlier DOM MutationObserver-based auto-dismiss
 // attempt here never actually worked (confirmed live: the toast still
@@ -1362,7 +1364,7 @@ export default definePlugin({
         }
 
         // The actual patch is applied in preload before this plugin even
-        // loads (see discordNativePatch.ts); this just installs the
+        // loads (see preload.ts); this just installs the
         // window-event listener that receives its results.
         patchDiscordVoice();
 
