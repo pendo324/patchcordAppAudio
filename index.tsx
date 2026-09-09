@@ -1,49 +1,20 @@
 /*
  * Equicord userplugin: patchcordAppAudio
  * SPDX-License-Identifier: GPL-3.0-or-later
- *
- * Adds a "share this app's audio instead of system audio" picker to
- * native Discord's screenshare flow.
- *
- * Discord's native Linux desktop client does NOT use the standard Web
- * getDisplayMedia() API for screenshare when `native_screenshare_picker`
- * is active (confirmed live: it never fires; confirmed via strings on
- * discord_voice.node that `features.declareSupported('native_screenshare_
- * picker')` is set whenever XDG_SESSION_TYPE starts with "wayland"). The
- * whole flow instead runs through the `discord_voice` native module
- * (discord_voice.node, loaded like discord_utils via
- * DiscordNative.nativeModules.requireModule("discord_voice")), which
- * calls straight into `BaseCapturerPipeWire` in C++, bypassing Chromium's
- * desktopCapturer/getDisplayMedia entirely for both the video source AND
- * (per the `SetWumpusSource`/`SetScreenshareSourceLinux` native symbols)
- * potentially audio-source selection.
- *
- * The real hook point is `VoiceEngine.createVoiceConnectionWithOptions`
- * (the module's exported connection factory): every real voice/stream
- * connection Discord ever makes goes through it, and the object it
- * returns exposes `setDesktopSourceWithOptions(options)` -- the same
- * function `discord_voice.node`'s native `SetDesktopSourceWithOptions`
- * binding backs. We wrap that factory so every connection's
- * `setDesktopSourceWithOptions` is intercepted: our own overlay modal
- * (independent of Discord's own DOM/CSS, which was the actual root cause
- * of two earlier, now-abandoned modal-injection attempts -- Discord's
- * button text and CSS module hashes both turned out to be a moving
- * target) is shown right when Discord tries to actually start the
- * desktop-source capture, i.e. right after the user has finished the
- * real (portal-native) window/screen picker.
  */
 
-import { definePluginSettings } from "@api/Settings";
 import { NavContextMenuPatchCallback } from "@api/ContextMenu";
-import definePlugin, { OptionType, StartAt } from "@utils/types";
+import { definePluginSettings } from "@api/Settings";
 import { Logger } from "@utils/Logger";
-import type { PluginNative } from "@utils/types";
-import { Alerts, ApplicationStreamingStore, Button, Menu } from "@webpack/common";
+import definePlugin, { OptionType, PluginNative, PluginNativeEvents, StartAt } from "@utils/types";
 import { onceReady } from "@webpack";
+import { Alerts, ApplicationStreamingStore, Button, Menu } from "@webpack/common";
+
+import * as orchestration from "./nativeOrchestration";
 
 const logger = new Logger("PatchcordAppAudio");
 
-const Native = VencordNative.pluginHelpers.PatchcordAppAudio as PluginNative<typeof import("./native")>;
+const Native = VencordNative.pluginHelpers.PatchcordAppAudio as unknown as PluginNative<typeof import("./native")> & PluginNativeEvents;
 
 const settings = definePluginSettings({
     rememberLastSelection: {
@@ -176,7 +147,7 @@ function nodeMatchesHint(node: ShareableNode, hint: ScreencastHint): boolean {
 
 async function fetchShareableNodes(includeDevices = false): Promise<ShareableNode[]> {
     try {
-        return await Native.listShareableNodes(includeDevices);
+        return await orchestration.listShareableNodes(Native, includeDevices);
     } catch (e) {
         logger.error("Failed to list shareable nodes", e);
         return [];
@@ -185,7 +156,7 @@ async function fetchShareableNodes(includeDevices = false): Promise<ShareableNod
 
 async function fetchScreencastHint(): Promise<ScreencastHint | null> {
     try {
-        return await Native.findScreencastHint();
+        return await orchestration.findScreencastHint(Native);
     } catch (e) {
         logger.warn("Failed to fetch screencast hint (non-fatal)", e);
         return null;
@@ -390,7 +361,6 @@ function createMultiSelect(
         focus: () => trigger.focus(),
     };
 }
-
 
 /**
  * Result of the picker: which nodes to actually pass to patchcord's
@@ -902,7 +872,7 @@ async function applyAppAudioRouting(nodes: ShareableNode[], filter: RouteFilter)
             ? [...new Set(nodes.map(n => n.applicationName).filter((v): v is string => !!v))]
             : undefined;
 
-        const ok = await Native.startAppAudio(nodes.map(n => n.id), filter, groupApplicationNames);
+        const ok = await orchestration.startAppAudio(Native, nodes.map(n => n.id), filter, groupApplicationNames);
         if (!ok) {
             logger.warn("patchcord failed to start app audio routing.");
             return null;
@@ -910,7 +880,7 @@ async function applyAppAudioRouting(nodes: ShareableNode[], filter: RouteFilter)
 
         logger.info(`App audio routing active for ${nodes.length} node(s) via discord_capture direct link.`);
         return () => {
-            Native.stopAppAudio?.().catch(() => {});
+            orchestration.stopAppAudio().catch(() => {});
         };
     } catch (e) {
         logger.error("Failed to apply app-audio routing via patchcord", e);
@@ -1192,28 +1162,89 @@ const manageStreamsContextPatch: NavContextMenuPatchCallback = children => {
 };
 
 /**
- * Runs `installDiscordCaptureShim` (the actual download+patch, see its
- * own doc comment in native.ts for why this has to be a distinct,
- * explicitly user-triggered action rather than something that runs
- * automatically) and reports the result via a toast/log, so the button
- * gives real feedback either way instead of silently succeeding or
- * failing.
+ * Shows an explicit consent dialog for one specific native asset that
+ * `nativeOrchestration` reported as `not_consented` (identified by its
+ * own name + the exact checksum of the bytes actually downloaded), then
+ * -- only if approved -- records that consent via `Native.recordConsent`
+ * and re-runs `retry`. Declining does nothing further (the caller's
+ * original action simply doesn't happen); this dialog can always be
+ * triggered again later by re-attempting the same action (e.g. clicking
+ * "Install audio capture shim" again).
+ *
+ * Note this dialog is a courtesy layer, not the security boundary --
+ * `Native.recordConsent` itself independently verifies (native-side)
+ * that the `(assetName, sha256)` pair being consented-to was actually
+ * observed as a real pending download by this plugin's own code before
+ * granting anything (see native/consentGate.ts's own doc comment). This
+ * function cannot forge consent for an asset that was never genuinely
+ * downloaded and hashed.
+ */
+async function promptConsentAndRetry<T extends { ok: boolean }>(
+    result: T,
+    description: string,
+    retry: () => Promise<T>
+): Promise<T> {
+    if (result.ok) return result;
+    if ((result as any).reason !== "not_consented") return result;
+
+    const { assetName, sha256 } = result as any;
+
+    return new Promise<T>(resolve => {
+        Alerts.show({
+            title: "Allow native component download?",
+            body: (
+                <div>
+                    <p>{description}</p>
+                    <p>
+                        <code>{assetName}</code> (checksum <code>{sha256.slice(0, 12)}…</code>) needs to be
+                        downloaded and run to continue.
+                    </p>
+                </div>
+            ),
+            confirmText: "Allow",
+            cancelText: "Cancel",
+            onConfirm: async () => {
+                await Native.recordConsent(assetName, sha256);
+                resolve(await retry());
+            },
+            onCancel: () => resolve(result),
+        });
+    });
+}
+
+/**
+ * Runs the discord-capture-shim install sequence, prompting for consent
+ * (per-asset, see promptConsentAndRetry) as needed, and reports the
+ * final result via an alert.
  */
 async function runInstallDiscordCaptureShim() {
-    const result = await Native.installDiscordCaptureShim();
+    let result = await orchestration.installShim(Native);
+    result = await promptConsentAndRetry(
+        result,
+        "PatchcordAppAudio needs a small native component (discord-capture-shim) to actually limit " +
+        "screenshare audio to the app(s) you pick. Without it, Discord shares every detected app's audio " +
+        "at once (its normal built-in behavior) regardless of what you select in this plugin's picker. " +
+        "Installing patches a copy of Discord's own discord_voice.node in your current install to load " +
+        "it -- a backup is kept and the patch can be undone later (Restore original discord_voice.node).",
+        () => orchestration.installShim(Native)
+    );
+
     if (result.ok) {
-        logger.info("discord-capture-shim installed:", result.message);
+        logger.info("discord-capture-shim installed:", (result as any).message);
         Alerts.show({
             title: "Audio capture shim installed",
             body: <p>Per-app audio sharing is now active. You may need to restart Discord for this to take full effect.</p>,
         });
-    } else {
-        logger.error("discord-capture-shim install failed:", result.message);
+    } else if ((result as any).reason !== "not_consented") {
+        logger.error("discord-capture-shim install failed:", (result as any).message);
         Alerts.show({
             title: "Audio capture shim install failed",
-            body: <p>{result.message}</p>,
+            body: <p>{(result as any).message}</p>,
         });
     }
+    // reason === "not_consented" after promptConsentAndRetry means the
+    // user declined -- no further alert needed, they just saw the
+    // consent dialog itself.
 }
 
 function InstallShimButton() {
@@ -1229,12 +1260,26 @@ function RestoreShimButton() {
         <Button
             color={Button.Colors.RED}
             onClick={() => {
-                void Native.restoreDiscordCaptureShim().then(() => {
-                    Alerts.show({
-                        title: "Restored",
-                        body: <p>discord_voice.node has been restored to its original, unpatched state.</p>,
-                    });
-                });
+                void (async () => {
+                    let result = await orchestration.restoreShim(Native);
+                    result = await promptConsentAndRetry(
+                        result,
+                        "Restoring requires running discord-capture-setup, the same native component used to " +
+                        "install the shim.",
+                        () => orchestration.restoreShim(Native)
+                    );
+                    if (result.ok) {
+                        Alerts.show({
+                            title: "Restored",
+                            body: <p>discord_voice.node has been restored to its original, unpatched state.</p>,
+                        });
+                    } else if ((result as any).reason !== "not_consented") {
+                        Alerts.show({
+                            title: "Restore failed",
+                            body: <p>{(result as any).message}</p>,
+                        });
+                    }
+                })();
             }}
         >
             Restore original discord_voice.node
@@ -1243,23 +1288,24 @@ function RestoreShimButton() {
 }
 
 /**
- * Shows an explicit, one-time (per decline) consent prompt before ever
- * downloading or running discord-capture-shim/discord-capture-setup --
- * see installDiscordCaptureShim's own doc comment in native.ts for why
- * this can't just run silently on plugin start. Checks
- * getDiscordCaptureShimStatus() first (a read-only, no-side-effects
- * check) so a user who already installed it, or whose platform doesn't
- * support it at all, is never asked. Declining sets
- * discordCaptureShimPromptDeclined so the prompt doesn't reappear every
- * launch -- the "Install audio capture shim" settings button remains
- * available any time the user changes their mind.
+ * Shows an explicit, one-time (per decline) install-offer prompt before
+ * ever attempting discord-capture-shim installation -- separate from,
+ * and prior to, the per-asset download-consent prompt
+ * (promptConsentAndRetry) that installShim's own not_consented results
+ * trigger. This first prompt is about whether the user wants the
+ * feature at all; the second is the actual native-code-execution
+ * consent gate. Checks getShimStatus() first (read-only) so a user who
+ * already installed it, or whose platform doesn't support it, is never
+ * asked. Declining sets discordCaptureShimPromptDeclined so this
+ * specific prompt doesn't reappear every launch -- the "Install audio
+ * capture shim" settings button remains available regardless.
  */
 async function maybePromptDiscordCaptureShimInstall() {
     if (settings.store.discordCaptureShimPromptDeclined) return;
 
-    let status: Awaited<ReturnType<typeof Native.getDiscordCaptureShimStatus>>;
+    let status: orchestration.ShimStatus;
     try {
-        status = await Native.getDiscordCaptureShimStatus();
+        status = await orchestration.getShimStatus(Native);
     } catch (e) {
         logger.error("Failed to check discord-capture-shim status", e);
         return;
@@ -1277,10 +1323,10 @@ async function maybePromptDiscordCaptureShimInstall() {
                     select in this plugin's picker.
                 </p>
                 <p>
-                    Installing it will download two small helper binaries and patch a copy of Discord's
-                    own <code>discord_voice.node</code> in your current install to load it. A backup of
-                    the original file is kept, and the patch can be fully undone later from this plugin's
-                    settings (Restore original discord_voice.node).
+                    Installing it will download two small helper binaries (you'll be asked to separately
+                    confirm each download) and patch a copy of Discord's own <code>discord_voice.node</code> in
+                    your current install to load it. A backup of the original file is kept, and the patch can be
+                    fully undone later from this plugin's settings (Restore original discord_voice.node).
                 </p>
             </div>
         ),
@@ -1334,7 +1380,8 @@ export default definePlugin({
 
     stop() {
         unpatchDiscordVoice();
-        Native.stopAppAudio?.();
+        orchestration.stopAppAudio().catch(() => {});
+        orchestration.disposePatchcord();
     },
 
     contextMenus: {

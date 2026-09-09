@@ -1,3 +1,9 @@
+/*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 import { EventEmitter } from "node:events";
 
 export interface ShareableNode {
@@ -36,76 +42,68 @@ export interface ScreencastHint {
     hint: string;
 }
 
-export interface VirtualSinkInfo {
-    sinkName: string;
-    monitorSource: string;
-    nodeId: number;
-    virtualMicName?: string | null;
-    virtualMicDescription?: string | null;
+/**
+ * The generic native.ts IPC surface this client drives (a subset of
+ * `VencordNative.pluginHelpers.PatchcordAppAudio`), passed in explicitly
+ * rather than imported directly -- see patchcordClient.js's own doc
+ * comment for why.
+ */
+export interface NativeHandle {
+    invoke(method: string, ...args: any[]): Promise<any>;
+    on(eventName: string, callback: (...args: any[]) => void): () => void;
 }
 
 export interface AudioSharePatchbayOptions {
-    command: string;
+    /** The release asset name for the patchcord binary itself, e.g. `patchcord-linux-x64`. */
+    assetName: string;
+    releaseUrlBase: string;
     args?: readonly string[];
-    cwd?: string;
-    env?: NodeJS.ProcessEnv;
     requestTimeoutMs?: number;
     shutdownTimeoutMs?: number;
     sinkPrefix?: string;
     sinkDescription?: string;
     virtualMic?: boolean;
-    /**
-     * Creates the virtual sink as a plain Audio/Sink (rather than
-     * Audio/Sink/Virtual) and makes it the system default sink once ready,
-     * so app-routed audio actually reaches Discord's own "Stream With
-     * Audio" capture (which always grabs the *default* sink's monitor).
-     * Mutually exclusive with virtualMic -- see PatchbayConfig's Rust doc
-     * comment for why.
-     */
     sinkBecomesDefault?: boolean;
     virtualMicName?: string;
     virtualMicDescription?: string;
 }
 
+export type StartResult =
+    | { ok: true }
+    | { ok: false; reason: string;[key: string]: any };
+
 export declare class AudioSharePatchbay extends EventEmitter {
-    constructor(options: AudioSharePatchbayOptions);
+    constructor(nativeHandle: NativeHandle, options: AudioSharePatchbayOptions);
+
+    /**
+     * Ensures the patchcord asset is downloaded (consent-gated -- may
+     * return `{ ok: false, reason: "not_consented", ... }`, in which
+     * case the caller should drive the consent flow via native.ts's
+     * `recordConsent` and call `start()` again) and spawned. Idempotent.
+     */
+    start(): Promise<StartResult>;
+
     hasPipeWire(): Promise<boolean>;
     listShareableNodes(includeDevices?: boolean): Promise<ShareableNode[]>;
     findScreencastHint(): Promise<ScreencastHint | null>;
-    ensureVirtualSink(): Promise<VirtualSinkInfo>;
-    routeNodes(nodeIds: number[], filter?: RouteFilter): Promise<VirtualSinkInfo>;
-    clearRoutes(): Promise<void>;
-    setVirtualMicMute(mute: boolean): Promise<void>;
-    setDefaultSinkToVirtual(): Promise<void>;
-    restoreDefaultSink(): Promise<void>;
     /**
      * Routes the given node id(s) directly into every one of Discord's
      * own `discord_capture` screenshare-audio nodes, replacing whatever
      * selection was previously routed there. Pass an empty array to stop
-     * routing anything. Requires `discord-capture-shim` to be
-     * `LD_PRELOAD`'d into the Discord process, or `discord_capture`
-     * nodes will keep auto-linking themselves to every detected app
-     * regardless of this call. `filter` behaves identically to
-     * `routeNodes`'s (applied server-side via the same `should_link`
-     * decision). Unlike `routeNodes`, needs no prior
-     * `ensureVirtualSink()` call -- `discord_capture` is Discord's own
-     * node, read directly in-process, so there's no virtual sink/mic
-     * involved on this path.
+     * routing anything. Requires `discord-capture-shim` to be installed
+     * (see nativeOrchestration.ts), or `discord_capture` nodes keep
+     * auto-linking themselves to every detected app regardless.
      */
     setDiscordCaptureTargets(nodeIds: number[], filter?: RouteFilter): Promise<void>;
     dispose(): Promise<void>;
 
-    on(eventName: 'graphChanged' | 'monitorDied', listener: () => void): this;
-    once(eventName: 'graphChanged' | 'monitorDied', listener: () => void): this;
-    off(eventName: 'graphChanged' | 'monitorDied', listener: () => void): this;
-    emit(eventName: 'graphChanged' | 'monitorDied'): boolean;
+    on(eventName: "graphChanged" | "monitorDied", listener: () => void): this;
+    once(eventName: "graphChanged" | "monitorDied", listener: () => void): this;
+    off(eventName: "graphChanged" | "monitorDied", listener: () => void): this;
+    emit(eventName: "graphChanged" | "monitorDied"): boolean;
 
     on(eventName: string | symbol, listener: (...args: any[]) => void): this;
     once(eventName: string | symbol, listener: (...args: any[]) => void): this;
     off(eventName: string | symbol, listener: (...args: any[]) => void): this;
     emit(eventName: string | symbol, ...args: any[]): boolean;
 }
-
-export declare function hasPipeWire(
-    options: AudioSharePatchbayOptions,
-): Promise<boolean>;
