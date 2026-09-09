@@ -4,7 +4,42 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { EventEmitter } from "node:events";
+// A minimal EventEmitter, not "node:events" -- this file is imported
+// from renderer-side code (nativeOrchestration.ts), and the renderer
+// bundle target has no Node builtins available (confirmed live: esbuild
+// fails to resolve "node:events" when building dist/desktop/renderer.js
+// -- unlike the old version of this file, which only ever ran in the
+// main process via native.ts and could rely on real Node builtins).
+class EventEmitter {
+    #listeners = new Map();
+
+    on(eventName, listener) {
+        let set = this.#listeners.get(eventName);
+        if (!set) this.#listeners.set(eventName, set = new Set());
+        set.add(listener);
+        return this;
+    }
+
+    off(eventName, listener) {
+        this.#listeners.get(eventName)?.delete(listener);
+        return this;
+    }
+
+    once(eventName, listener) {
+        const wrapper = (...args) => {
+            this.off(eventName, wrapper);
+            listener(...args);
+        };
+        return this.on(eventName, wrapper);
+    }
+
+    emit(eventName, ...args) {
+        const set = this.#listeners.get(eventName);
+        if (!set || set.size === 0) return false;
+        for (const listener of [...set]) listener(...args);
+        return true;
+    }
+}
 
 export class AudioSharePatchbay extends EventEmitter {
     #nativeHandle;
