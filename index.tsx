@@ -34,9 +34,12 @@
  */
 
 import { definePluginSettings } from "@api/Settings";
+import { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import definePlugin, { OptionType, StartAt } from "@utils/types";
 import { Logger } from "@utils/Logger";
 import type { PluginNative } from "@utils/types";
+import { ApplicationStreamingStore, Menu } from "@webpack/common";
+import { onceReady } from "@webpack";
 
 const logger = new Logger("PatchcordAppAudio");
 
@@ -83,6 +86,14 @@ const settings = definePluginSettings({
         description: "Allow picking a physical input/output device (e.g. a microphone) instead of an app. Requires \"Exclude physical devices\" to be off.",
         default: false,
     },
+    groupByApplication: {
+        type: OptionType.BOOLEAN,
+        description:
+            "Selecting one node from an app selects/shares all of that app's audio nodes (e.g. every open " +
+            "Firefox tab, not just the one you clicked), and any new node the app opens later while you're " +
+            "already sharing it is picked up automatically.",
+        default: false,
+    },
 });
 
 interface ShareableNode {
@@ -95,6 +106,7 @@ interface ShareableNode {
     mediaClass: string | null;
     isVirtual: boolean;
     binary?: string | null;
+    mediaName?: string | null;
 }
 
 interface RouteFilter {
@@ -154,6 +166,18 @@ async function fetchScreencastHint(): Promise<ScreencastHint | null> {
 }
 
 let lastSelectedNodeNames: string[] = [];
+
+/**
+ * The node keys currently actually routed into `discord_capture` (or
+ * empty if none), independent of `lastSelectedNodeNames` -- which only
+ * tracks a *remembered* selection and is itself gated behind the
+ * "remember last selection between shares" setting. This one is always
+ * kept in sync with reality regardless of that setting, purely so
+ * reopening the picker mid-stream (see `reopenPickerMidStream`) can show
+ * what's actually currently selected rather than an empty list whenever
+ * the user has that unrelated setting turned off.
+ */
+let activeSelectionNodeNames: string[] = [];
 
 /**
  * Overall picker mode, mirroring Vesktop's "None" / single-or-multi-app /
@@ -353,18 +377,78 @@ function createMultiSelect(
 interface PickerResult {
     mode: PickerMode;
     nodes: ShareableNode[];
+    /**
+     * True only when the picker was dismissed via Escape -- distinct from
+     * an explicit "Skip (normal audio)" click, which also resolves with
+     * `mode: "none"` but is NOT cancelled. Callers reopening this picker
+     * mid-stream (see index.tsx's "Change apps..." button) need this
+     * distinction: Escape means "never mind, leave my current selection
+     * alone", while Skip is a deliberate "stop sharing any app's audio"
+     * request. The very first picker (shown when a screenshare starts)
+     * doesn't need the distinction -- there's no prior selection to
+     * preserve yet, so both cases already correctly mean "share normal
+     * system audio" there.
+     */
+    cancelled: boolean;
 }
 
+/**
+ * Unique key for one node in the picker's selection state.
+ *
+ * Previously fell back to plain `node.nodeName` when present (e.g.
+ * "Firefox"), which is NOT unique -- confirmed live: every tab/window an
+ * app opens shares the exact same `node.name`, so two live Firefox tabs
+ * collided on the identical key, silently merging them into a single
+ * selectable/toggleable entry in the multi-select (toggling one toggled
+ * both, and only one was ever actually distinguishable in
+ * `currentValues`). `node.id` is `ShareableNode.id`, the live PipeWire
+ * registry id -- guaranteed unique among currently-live nodes, which is
+ * exactly the uniqueness this key needs. It does change across process
+ * restarts (a relaunched Firefox gets a fresh id), which is why
+ * `nodeName` was preferred before for the "remember my last selection
+ * between shares" feature to survive that -- but that goal was already
+ * unachievable in exactly the multi-tab-collision case this fixes (there
+ * would be no way to tell *which* remembered tab to reselect even if the
+ * key did survive), so always keying by the specific live id is strictly
+ * more correct: single-instance apps (Spotify, Discord's own capture,
+ * etc.) still round-trip through `lastSelectedNodeNames` correctly in
+ * the common case where the same node.name only ever resolves to one
+ * live id at a time, and never silently merges distinct nodes together.
+ */
 function nodeKey(node: ShareableNode): string {
-    return node.nodeName ?? `${node.displayName}#${node.id}`;
+    return `${node.nodeName ?? node.displayName}#${node.id}`;
 }
 
-function showAudioPickerModal(initialNodes: ShareableNode[], initialHint: ScreencastHint | null): Promise<PickerResult> {
+/**
+ * Human-facing label for one node in the picker list. `displayName` is
+ * usually just the app's own name (e.g. "Firefox") -- Discord/PipeWire
+ * only exposes the more specific detail (which tab, which track) via
+ * `media_name`, which is otherwise dropped entirely. Appending it in
+ * parens when it's actually more specific than the plain app name (not
+ * identical, not empty) turns "Firefox" into "Firefox (Artcore/DnB
+ * Playlist - YouTube)" so multiple tabs/windows of the same app are
+ * distinguishable in the list instead of showing up as several
+ * identically-labelled "Firefox" entries.
+ */
+function nodeLabel(node: ShareableNode): string {
+    const detail = node.mediaName?.trim();
+    if (!detail || detail === node.displayName || detail === node.applicationName) {
+        return node.displayName;
+    }
+    return `${node.displayName} (${detail})`;
+}
+
+function showAudioPickerModal(
+    initialNodes: ShareableNode[],
+    initialHint: ScreencastHint | null,
+    initialMode: PickerMode = "none"
+): Promise<PickerResult> {
     logger.info("showAudioPickerModal called with", initialNodes.length, "nodes, hint =", initialHint);
     return new Promise(resolve => {
         let nodes = initialNodes;
         let hint = initialHint;
         let mode: PickerMode = "none";
+        let isFirstRender = true;
         let filterActive = hint != null;
         let refreshing = false;
 
@@ -452,7 +536,7 @@ function showAudioPickerModal(initialNodes: ShareableNode[], initialHint: Screen
         function toOptions(list: ShareableNode[]) {
             const opts: { value: string; label: string; disabled?: boolean; node: ShareableNode | null; }[] = [];
             for (const node of list) {
-                opts.push({ value: nodeKey(node), label: node.displayName, node });
+                opts.push({ value: nodeKey(node), label: nodeLabel(node), node });
             }
             if (list.length === 0) {
                 opts.push({
@@ -475,6 +559,20 @@ function showAudioPickerModal(initialNodes: ShareableNode[], initialHint: Screen
         }
 
         function preselectedValues(list: ShareableNode[]): Set<string> {
+            // The very first render, when reopened mid-stream with an
+            // active selection (initialMode === "apps"): preselect
+            // exactly what's actually routed right now, regardless of
+            // the separate "remember last selection" setting -- see
+            // activeSelectionNodeNames's own doc comment for why that
+            // setting shouldn't gate this. Only applies once; any
+            // subsequent render in this same modal (mode switches,
+            // Refresh) falls through to the normal
+            // lastSelectedNodeNames-based behavior below, unchanged from
+            // before.
+            if (isFirstRender && initialMode === "apps" && activeSelectionNodeNames.length > 0) {
+                const keys = new Set(list.map(nodeKey));
+                return new Set(activeSelectionNodeNames.filter(n => keys.has(n)));
+            }
             if (!settings.store.rememberLastSelection || lastSelectedNodeNames.length === 0) return new Set();
             const keys = new Set(list.map(nodeKey));
             return new Set(lastSelectedNodeNames.filter(n => keys.has(n)));
@@ -520,6 +618,7 @@ function showAudioPickerModal(initialNodes: ShareableNode[], initialHint: Screen
             if (mode === "none") {
                 description.textContent = "Discord will share its normal (whole-system default) audio, same as without this plugin.";
                 if (hintNotice) hintNotice.remove();
+                groupByAppRow.style.display = "none";
                 shareBtn.textContent = "Start Sharing";
                 return;
             }
@@ -530,6 +629,7 @@ function showAudioPickerModal(initialNodes: ShareableNode[], initialHint: Screen
                     "default output. Pick one or more.";
                 const list = currentAppList();
                 const preselected = preselectedValues(list);
+                isFirstRender = false;
                 if (multi) {
                     multi.setOptions(toOptions(list), preselected, "Select apps to share\u2026");
                 } else {
@@ -540,6 +640,7 @@ function showAudioPickerModal(initialNodes: ShareableNode[], initialHint: Screen
                     selectContainer.insertBefore(hintNotice, multi.root);
                     updateHintNotice();
                 }
+                groupByAppRow.style.display = "flex";
                 shareBtn.textContent = "Start Sharing";
                 return;
             }
@@ -557,6 +658,12 @@ function showAudioPickerModal(initialNodes: ShareableNode[], initialHint: Screen
                 multi = createMultiSelect(toOptions(excludable), preselected, "Exclude apps (optional)\u2026");
             }
             selectContainer.appendChild(multi.root);
+            // "Group by application" only makes sense when picking specific
+            // apps to include -- "Entire System" mode already includes
+            // every node from every app minus the excluded ones, whether
+            // grouping is on or not (see applyAppAudioRouting's own
+            // comment on the same point).
+            groupByAppRow.style.display = "none";
             shareBtn.textContent = "Start Sharing";
         }
 
@@ -567,6 +674,26 @@ function showAudioPickerModal(initialNodes: ShareableNode[], initialHint: Screen
         }
 
         dialog.appendChild(selectContainer);
+
+        // --- "group by application" (promoted out of Advanced audio
+        // filters -- more immediately useful than the rest of that
+        // panel, and only meaningful in "apps" mode, so it's toggled
+        // visible/hidden by renderList() itself rather than hidden
+        // behind an extra click every time). --------------------------
+        const groupByAppRow = document.createElement("label");
+        groupByAppRow.style.cssText = "display: none; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; margin-top: 10px;";
+        const groupByAppCheckbox = document.createElement("input");
+        groupByAppCheckbox.type = "checkbox";
+        groupByAppCheckbox.checked = !!settings.store.groupByApplication;
+        groupByAppCheckbox.onchange = () => {
+            settings.store.groupByApplication = groupByAppCheckbox.checked;
+        };
+        groupByAppRow.appendChild(groupByAppCheckbox);
+        const groupByAppLabel = document.createElement("span");
+        groupByAppLabel.textContent = "Share all tabs/windows of each picked app (not just the one selected)";
+        groupByAppLabel.style.color = DISCORD_VARS.textNormal;
+        groupByAppRow.appendChild(groupByAppLabel);
+        dialog.appendChild(groupByAppRow);
 
         // --- advanced filters (item 4: granular/device selection + the
         // rest of patchcord's RouteFilter) -------------------------------
@@ -645,18 +772,27 @@ function showAudioPickerModal(initialNodes: ShareableNode[], initialHint: Screen
             return shareableFor(nodes).filter(n => !excludedKeys.has(nodeKey(n)));
         }
 
-        function finish() {
+        function finish(cancelled = false) {
             const resultNodes = computeResultNodes();
-            if (settings.store.rememberLastSelection) {
-                lastSelectedNodeNames = mode === "apps" ? resultNodes.map(nodeKey) : [];
+            if (!cancelled) {
+                // Cancel (Escape) must never touch either of these --
+                // mode was already forced to "none" by the Escape
+                // handler purely to make computeResultNodes() return an
+                // empty result for the (unused, since cancelled=true)
+                // `nodes` field, not because anything should actually
+                // change.
+                activeSelectionNodeNames = mode === "apps" ? resultNodes.map(nodeKey) : [];
+                if (settings.store.rememberLastSelection) {
+                    lastSelectedNodeNames = activeSelectionNodeNames;
+                }
             }
             overlay.remove();
             document.removeEventListener("keydown", onKeydown, true);
-            resolve({ mode, nodes: resultNodes });
+            resolve({ mode, nodes: resultNodes, cancelled });
         }
 
         const shareBtn = makeButton("Start Sharing", true);
-        shareBtn.onclick = finish;
+        shareBtn.onclick = () => finish(false);
 
         const skipBtn = makeButton("Skip (normal audio)", false);
         skipBtn.onclick = () => {
@@ -696,67 +832,115 @@ function showAudioPickerModal(initialNodes: ShareableNode[], initialHint: Screen
         logger.info("Audio picker overlay appended to document.body. body.contains(overlay):", document.body.contains(overlay), "overlay rect:", overlay.getBoundingClientRect());
 
         function onKeydown(e: KeyboardEvent) {
-            if (e.key === "Escape") { multi?.close(); mode = "none"; finish(); }
+            if (e.key === "Escape") { multi?.close(); mode = "none"; finish(true); }
         }
         document.addEventListener("keydown", onKeydown, true);
 
-        setMode("none");
+        setMode(initialMode);
     });
-}
-
-async function findVirtualMicDeviceId(description: string, timeoutMs = 3000): Promise<string | undefined> {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const match = devices.find(d => d.kind === "audioinput" && d.label === description);
-        if (match) return match.deviceId;
-        if (Date.now() >= deadline) return undefined;
-        await new Promise(r => setTimeout(r, 150));
-    }
 }
 
 /**
  * Actually applies app-audio routing once the user has picked one or more
- * nodes from our overlay modal: routes those nodes' audio into patchcord's
- * virtual sink, then swaps Discord's own microphone input device to the
- * resulting virtual mic for the duration of the share. This works
- * regardless of whether Discord's screenshare pipeline uses
- * getUserMedia/getDisplayMedia or its own native discord_voice audio
- * capture, since it operates at the OS audio-device level
- * (enumerateDevices()/deviceId), not by intercepting a MediaStream object
- * -- there is no MediaStream to intercept on the native-picker path.
+ * nodes from our overlay modal: links those nodes' audio directly into
+ * every live `discord_capture` node -- Discord's own native per-app
+ * screenshare-audio capture, confirmed this session (via a real
+ * disconnect/reconnect test against a live viewer) to be the actual
+ * audio path "Stream With Audio" uses. This requires
+ * `discord-capture-shim` (a separate LD_PRELOAD native library, not part
+ * of this plugin -- see its own README) to be installed, which strips
+ * Discord's own auto-linking properties from each `discord_capture`
+ * stream before it's created; without the shim, this call still
+ * succeeds and still creates the requested links, but Discord's own
+ * auto-linking keeps adding every other detected app's link right
+ * alongside them, so nothing appears to change from the user's
+ * perspective.
  *
  * `filter` is patchcord's RouteFilter (onlySpeakers/onlyDefaultSpeakers/
  * ignoreDevices/ignoreVirtual/ignoreInputMedia -- see currentRouteFilter);
- * applied server-side by patchcord's own routeNodes (state_native.rs's
- * should_link), not pre-filtered here, so "Entire System" mode's already
- * broad candidate list gets narrowed down correctly regardless of exactly
- * which nodes were passed in.
+ * applied server-side by patchcord's own setDiscordCaptureTargets (the
+ * identical should_link decision routeNodes uses), not pre-filtered
+ * here, so "Entire System" mode's already broad candidate list gets
+ * narrowed down correctly regardless of exactly which nodes were passed
+ * in.
  */
 async function applyAppAudioRouting(nodes: ShareableNode[], filter: RouteFilter): Promise<(() => void) | null> {
     logger.info("Applying app-audio routing for nodes:", nodes.map(n => `${n.id}:${n.displayName}`), "filter:", filter);
     try {
-        const micDescription = await Native.startAppAudio(nodes.map(n => n.id), filter);
-        logger.info("startAppAudio returned micDescription:", micDescription);
-        if (!micDescription) {
+        // "Group by application" only makes sense for a specific-apps
+        // selection -- "Entire System" already includes every node from
+        // every app (minus the excluded ones) whether grouping is on or
+        // not, so there's nothing extra to expand there.
+        const groupApplicationNames = settings.store.groupByApplication
+            ? [...new Set(nodes.map(n => n.applicationName).filter((v): v is string => !!v))]
+            : undefined;
+
+        const ok = await Native.startAppAudio(nodes.map(n => n.id), filter, groupApplicationNames);
+        if (!ok) {
             logger.warn("patchcord failed to start app audio routing.");
             return null;
         }
 
-        const deviceId = await findVirtualMicDeviceId(micDescription);
-        logger.info("findVirtualMicDeviceId resolved deviceId:", deviceId);
-        if (!deviceId) {
-            logger.warn(`Virtual mic device "${micDescription}" not found via enumerateDevices().`);
-            return null;
-        }
-
-        logger.info(`App audio routing active for ${nodes.length} node(s) via patchcord virtual mic ${deviceId}.`);
+        logger.info(`App audio routing active for ${nodes.length} node(s) via discord_capture direct link.`);
         return () => {
             Native.stopAppAudio?.().catch(() => {});
         };
     } catch (e) {
         logger.error("Failed to apply app-audio routing via patchcord", e);
         return null;
+    }
+}
+
+/**
+ * Reopens the same picker modal used for the initial share, applies
+ * whatever new selection the user makes via the same
+ * `applyAppAudioRouting` path (which itself just calls
+ * `setDiscordCaptureTargets` again -- patchcord's own
+ * `sync_discord_capture_links` already tears down any links to
+ * newly-deselected apps and adds links for newly-selected ones, so there
+ * is no separate "update" vs "start" codepath needed on the Rust side).
+ * No picker-ack involved here at all -- that mechanism only exists to
+ * hold up Discord's own stream *start*, which already happened long
+ * before this button could even appear.
+ */
+async function reopenPickerMidStream(triggerBtn?: HTMLButtonElement) {
+    if (triggerBtn) triggerBtn.disabled = true;
+    try {
+        const includeDevices = settings.store.deviceSelect && !settings.store.ignoreDevices;
+        const [nodes, hint] = await Promise.all([fetchShareableNodes(includeDevices), fetchScreencastHint()]);
+        // Reopen already showing the currently-active selection (rather
+        // than always resetting to "None") when there is one --
+        // lastSelectedNodeNames already holds it regardless of the
+        // separate "remember last selection between shares" setting
+        // (that setting only controls whether it's *used* the next time
+        // a share starts fresh, not whether it's tracked at all).
+        const initialMode: PickerMode = lastSelectedNodeNames.length > 0 ? "apps" : "none";
+        const pick = await showAudioPickerModal(nodes, hint, initialMode);
+        logger.info("Mid-stream picker resolved with:", pick.mode, pick.nodes.map(n => n.displayName), "cancelled =", pick.cancelled);
+
+        if (pick.cancelled) {
+            // User hit Escape: leave the current routing exactly as it
+            // was, don't touch cleanupCurrentRouting, and the button
+            // stays visible for next time (it was never removed).
+            return;
+        }
+
+        if (cleanupCurrentRouting) {
+            try {
+                cleanupCurrentRouting();
+            } catch { /* best effort */ }
+            cleanupCurrentRouting = null;
+        }
+
+        if (pick.nodes.length === 0) {
+            return;
+        }
+
+        cleanupCurrentRouting = await applyAppAudioRouting(pick.nodes, currentRouteFilter());
+    } catch (e) {
+        logger.error("Failed to change apps mid-stream", e);
+    } finally {
+        if (triggerBtn) triggerBtn.disabled = false;
     }
 }
 
@@ -865,6 +1049,7 @@ function handleDesktopSourceEnded() {
         } catch { /* best effort */ }
         cleanupCurrentRouting = null;
     }
+    activeSelectionNodeNames = [];
 }
 
 function onScreenSharePickerResultEvent(ev: Event) {
@@ -876,11 +1061,49 @@ function onDesktopSourceEndedEvent(_ev: Event) {
     handleDesktopSourceEnded();
 }
 
+/**
+ * Fires on every `ApplicationStreamingStore` change; hides the "Change
+ * shared apps..." floating button and tears down routing the moment this
+ * client is no longer actively streaming, regardless of *how* the share
+ * ended -- clicking Discord's own "Stop Streaming" button, closing the
+ * shared window, a connection drop, etc. Added as a second, independent
+ * signal alongside `setOnDesktopSourceEnded`'s `desktopSourceEnded` event
+ * (see `handleDesktopSourceEnded`) rather than a replacement for it:
+ * confirmed live that clicking Discord's own local "Stop Streaming"
+ * control did NOT reliably fire `desktopSourceEnded` (that hook appears
+ * tied to the desktop *capture source* specifically ending -- e.g. the
+ * shared window closing -- not every way a user can end their own local
+ * share), leaving the button visible indefinitely after a manual stop.
+ * `ApplicationStreamingStore` is the same general-purpose Flux store
+ * other plugins already use to answer "is the current user streaming
+ * right now" (see equicordplugins/whosWatching), so it should reliably
+ * catch every case desktopSourceEnded doesn't.
+ */
+function onApplicationStreamingStoreChange() {
+    if (!ApplicationStreamingStore.getCurrentUserActiveStream()) {
+        handleDesktopSourceEnded();
+    }
+}
+
 function patchDiscordVoice() {
     if (pickerListenerInstalled) return;
     pickerListenerInstalled = true;
     window.addEventListener(SCREEN_SHARE_PICKER_RESULT_EVENT, onScreenSharePickerResultEvent);
     window.addEventListener(DESKTOP_SOURCE_ENDED_EVENT, onDesktopSourceEndedEvent);
+    // ApplicationStreamingStore (like every @webpack/common store export)
+    // is a plain mutable `export let`, populated asynchronously once
+    // Discord's own webpack modules are found -- confirmed live: still
+    // `undefined` at this exact point when this plugin's `startAt:
+    // StartAt.Init` runs (deliberately as early as possible, see this
+    // plugin's own startAt doc comment for why), which crashed this
+    // entire plugin's start with "Cannot read properties of undefined
+    // (reading 'addChangeListener')" and silently disabled the whole
+    // plugin. `onceReady` resolves once webpack's own modules (and
+    // therefore this store) are actually available.
+    onceReady.then(() => {
+        if (!pickerListenerInstalled) return; // unpatched again before this resolved
+        ApplicationStreamingStore.addChangeListener(onApplicationStreamingStoreChange);
+    });
     logger.info("Listening for native screenshare picker results and desktop-source-ended signals (patched in preload)");
 }
 
@@ -889,6 +1112,11 @@ function unpatchDiscordVoice() {
     pickerListenerInstalled = false;
     window.removeEventListener(SCREEN_SHARE_PICKER_RESULT_EVENT, onScreenSharePickerResultEvent);
     window.removeEventListener(DESKTOP_SOURCE_ENDED_EVENT, onDesktopSourceEndedEvent);
+    // Safe even if patchDiscordVoice's own onceReady.then() hasn't
+    // resolved yet (removeChangeListener on a listener that was never
+    // added is a documented no-op for Flux stores) or if
+    // ApplicationStreamingStore still isn't populated for some reason.
+    ApplicationStreamingStore?.removeChangeListener(onApplicationStreamingStoreChange);
     if (cleanupCurrentRouting) {
         try {
             cleanupCurrentRouting();
@@ -904,6 +1132,37 @@ function unpatchDiscordVoice() {
 // ever sees it) -- an earlier DOM MutationObserver-based auto-dismiss
 // attempt here never actually worked (confirmed live: the toast still
 // appeared), so it's been removed in favor of the lower-level fix.
+
+/**
+ * Injects a "Change shared apps..." entry into Discord's own local
+ * stream-controls popover -- the one with "Stop Streaming"/"Share Stream
+ * Audio"/"Pop Out Stream"/"More Options", opened by clicking your own
+ * active screenshare's toolbar icon. Registered for two navIds
+ * (confirmed live via Discord's own devtools element inspector):
+ * `manage-streams` (`aria-label="Stop Streaming"` -- the local controls
+ * popover this whole feature is meant for) and `stream-context` (a
+ * *different* menu, for viewing someone else's stream via
+ * `biggerStreamPreview`'s identical navId, but confirmed live to also
+ * render for your own stream in at least some entry points) -- same
+ * handler for both, since the "is app-audio routing active" gate and the
+ * action itself don't depend on which of the two menus triggered it.
+ *
+ * This is the only UI for reopening the picker mid-stream (an earlier
+ * floating-button fallback was tried and removed after live testing
+ * confirmed it had no reliable way to detect every path a user could end
+ * their own stream through, leaving it stuck visible).
+ */
+const manageStreamsContextPatch: NavContextMenuPatchCallback = children => {
+    if (!cleanupCurrentRouting) return;
+    children.push(
+        <Menu.MenuSeparator />,
+        <Menu.MenuItem
+            id="patchcord-change-apps"
+            label="Change shared audio…"
+            action={() => { void reopenPickerMidStream(); }}
+        />
+    );
+};
 
 export default definePlugin({
     name: "PatchcordAppAudio",
@@ -938,5 +1197,10 @@ export default definePlugin({
     stop() {
         unpatchDiscordVoice();
         Native.stopAppAudio?.();
+    },
+
+    contextMenus: {
+        "manage-streams": manageStreamsContextPatch,
+        "stream-context": manageStreamsContextPatch,
     },
 });
