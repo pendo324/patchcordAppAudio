@@ -38,7 +38,7 @@ import { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import definePlugin, { OptionType, StartAt } from "@utils/types";
 import { Logger } from "@utils/Logger";
 import type { PluginNative } from "@utils/types";
-import { ApplicationStreamingStore, Menu } from "@webpack/common";
+import { Alerts, ApplicationStreamingStore, Button, Menu } from "@webpack/common";
 import { onceReady } from "@webpack";
 
 const logger = new Logger("PatchcordAppAudio");
@@ -93,6 +93,33 @@ const settings = definePluginSettings({
             "Firefox tab, not just the one you clicked), and any new node the app opens later while you're " +
             "already sharing it is picked up automatically.",
         default: false,
+    },
+    // Tracks the user's answer to the discord-capture-shim install
+    // prompt (see maybePromptDiscordCaptureShimInstall below) so they
+    // aren't re-asked on every launch after declining once. Not shown as
+    // a visible toggle in the settings UI (hidden) -- it's consent
+    // bookkeeping, not a feature switch; the actual re-installable
+    // action is the "Install audio capture shim" button below, which
+    // works regardless of what this is set to.
+    discordCaptureShimPromptDeclined: {
+        type: OptionType.BOOLEAN,
+        description: "internal: user previously declined the discord-capture-shim install prompt",
+        default: false,
+        hidden: true,
+    },
+    installDiscordCaptureShim: {
+        type: OptionType.COMPONENT,
+        description:
+            "Downloads and installs discord-capture-shim, a small native component required for " +
+            "per-app audio sharing to actually work (without it, Discord shares every detected app's audio " +
+            "at once, same as its stock behavior). Patches discord_voice.node in your current Discord " +
+            "install; keeps a backup and can be undone with the button below.",
+        component: () => <InstallShimButton />,
+    },
+    restoreDiscordCaptureShim: {
+        type: OptionType.COMPONENT,
+        description: "Restores discord_voice.node to its original, unpatched state (undoes the button above).",
+        component: () => <RestoreShimButton />,
     },
 });
 
@@ -1164,6 +1191,106 @@ const manageStreamsContextPatch: NavContextMenuPatchCallback = children => {
     );
 };
 
+/**
+ * Runs `installDiscordCaptureShim` (the actual download+patch, see its
+ * own doc comment in native.ts for why this has to be a distinct,
+ * explicitly user-triggered action rather than something that runs
+ * automatically) and reports the result via a toast/log, so the button
+ * gives real feedback either way instead of silently succeeding or
+ * failing.
+ */
+async function runInstallDiscordCaptureShim() {
+    const result = await Native.installDiscordCaptureShim();
+    if (result.ok) {
+        logger.info("discord-capture-shim installed:", result.message);
+        Alerts.show({
+            title: "Audio capture shim installed",
+            body: <p>Per-app audio sharing is now active. You may need to restart Discord for this to take full effect.</p>,
+        });
+    } else {
+        logger.error("discord-capture-shim install failed:", result.message);
+        Alerts.show({
+            title: "Audio capture shim install failed",
+            body: <p>{result.message}</p>,
+        });
+    }
+}
+
+function InstallShimButton() {
+    return (
+        <Button onClick={() => { void runInstallDiscordCaptureShim(); }}>
+            Install audio capture shim
+        </Button>
+    );
+}
+
+function RestoreShimButton() {
+    return (
+        <Button
+            color={Button.Colors.RED}
+            onClick={() => {
+                void Native.restoreDiscordCaptureShim().then(() => {
+                    Alerts.show({
+                        title: "Restored",
+                        body: <p>discord_voice.node has been restored to its original, unpatched state.</p>,
+                    });
+                });
+            }}
+        >
+            Restore original discord_voice.node
+        </Button>
+    );
+}
+
+/**
+ * Shows an explicit, one-time (per decline) consent prompt before ever
+ * downloading or running discord-capture-shim/discord-capture-setup --
+ * see installDiscordCaptureShim's own doc comment in native.ts for why
+ * this can't just run silently on plugin start. Checks
+ * getDiscordCaptureShimStatus() first (a read-only, no-side-effects
+ * check) so a user who already installed it, or whose platform doesn't
+ * support it at all, is never asked. Declining sets
+ * discordCaptureShimPromptDeclined so the prompt doesn't reappear every
+ * launch -- the "Install audio capture shim" settings button remains
+ * available any time the user changes their mind.
+ */
+async function maybePromptDiscordCaptureShimInstall() {
+    if (settings.store.discordCaptureShimPromptDeclined) return;
+
+    let status: Awaited<ReturnType<typeof Native.getDiscordCaptureShimStatus>>;
+    try {
+        status = await Native.getDiscordCaptureShimStatus();
+    } catch (e) {
+        logger.error("Failed to check discord-capture-shim status", e);
+        return;
+    }
+    if (!status.supported || status.alreadyInstalled) return;
+
+    Alerts.show({
+        title: "Install audio capture component?",
+        body: (
+            <div>
+                <p>
+                    PatchcordAppAudio needs a small native component (discord-capture-shim) to actually
+                    limit screenshare audio to the app(s) you pick. Without it, Discord shares every
+                    detected app's audio at once (its normal built-in behavior) regardless of what you
+                    select in this plugin's picker.
+                </p>
+                <p>
+                    Installing it will download two small helper binaries and patch a copy of Discord's
+                    own <code>discord_voice.node</code> in your current install to load it. A backup of
+                    the original file is kept, and the patch can be fully undone later from this plugin's
+                    settings (Restore original discord_voice.node).
+                </p>
+            </div>
+        ),
+        confirmText: "Install",
+        cancelText: "Not now",
+        onConfirm: () => { void runInstallDiscordCaptureShim(); },
+        onCancel: () => { settings.store.discordCaptureShimPromptDeclined = true; },
+    });
+}
+
 export default definePlugin({
     name: "PatchcordAppAudio",
     description:
@@ -1192,6 +1319,17 @@ export default definePlugin({
         // loads (see discordNativePatch.ts); this just installs the
         // window-event listener that receives its results.
         patchDiscordVoice();
+
+        // Deferred to onceReady for the same reason ApplicationStreamingStore's
+        // listener below is (see that comment) -- and, separately, because
+        // showing an Alerts.show consent dialog this early in startup would
+        // be poor UX even if it worked. This is the only place
+        // discord-capture-shim installation is ever initiated without a
+        // direct user click (the settings button), and even here it's
+        // gated on an explicit confirm click in the dialog itself -- see
+        // maybePromptDiscordCaptureShimInstall's own doc comment for the
+        // full reasoning on why this can't just install silently.
+        onceReady.then(() => { void maybePromptDiscordCaptureShimInstall(); });
     },
 
     stop() {

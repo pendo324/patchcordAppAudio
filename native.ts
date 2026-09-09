@@ -68,7 +68,7 @@
 import { app } from "electron";
 import { dirname, join } from "path";
 import { existsSync, statSync } from "fs";
-import { mkdir, writeFile, chmod, readdir, copyFile } from "fs/promises";
+import { mkdir, writeFile, chmod, readdir, copyFile, readFile } from "fs/promises";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { createHash } from "crypto";
@@ -236,14 +236,64 @@ async function initPatchcord() {
         console.error("[patchcordAppAudio] Failed to init patchcord", e);
         hasPipewirePulse = false;
     }
-    // Best-effort: without discord-capture-shim actually LD_PRELOAD'd/
-    // DT_NEEDED'd into discord_voice.node, Discord's own autoconnect
-    // keeps linking every detected app regardless of what patchcord does
-    // (see this file's top doc comment) -- so this needs to run whether
-    // or not patchcord itself initialized successfully.
-    void ensureDiscordCaptureShimInstalled().catch(e => {
-        console.error("[patchcordAppAudio] Failed to install discord-capture-shim", e);
-    });
+    // Deliberately does NOT call ensureDiscordCaptureShimInstalled() here
+    // or anywhere else automatically -- see that function's own doc
+    // comment for why patching discord_voice.node requires explicit,
+    // renderer-driven user consent (index.tsx's install prompt) rather
+    // than running silently as a side effect of the plugin starting.
+}
+
+/**
+ * Read-only status check: is `discord-capture-shim.so` (or, more
+ * precisely, *some* DT_NEEDED entry named `discord-capture-shim.so`)
+ * already present in the currently running Discord install's
+ * `discord_voice.node`? Downloads nothing, writes nothing, executes
+ * nothing -- just parses the ELF header well enough to read its
+ * DT_NEEDED list, so index.tsx can decide whether to show the consent
+ * prompt at all without side effects. `discord-capture-setup` itself
+ * does the equivalent check (see setup.rs), but this needs to run
+ * *before* asking whether to download/execute that binary in the first
+ * place, so it's re-implemented as a plain read here rather than
+ * shelling out to a not-yet-downloaded tool to answer "should I
+ * download and run a tool?".
+ */
+export async function getDiscordCaptureShimStatus(_?: Electron.IpcMainInvokeEvent): Promise<{
+    supported: boolean;
+    alreadyInstalled: boolean;
+    voiceNodePaths: string[];
+}> {
+    if (process.platform !== "linux") {
+        return { supported: false, alreadyInstalled: false, voiceNodePaths: [] };
+    }
+
+    const voiceNodePaths = await findCurrentDiscordVoiceNodePaths();
+    if (voiceNodePaths.length === 0) {
+        return { supported: true, alreadyInstalled: false, voiceNodePaths: [] };
+    }
+
+    let alreadyInstalled = true;
+    for (const p of voiceNodePaths) {
+        try {
+            const buf = await readFile(p);
+            if (!buf.includes(Buffer.from("discord-capture-shim.so"))) {
+                alreadyInstalled = false;
+                break;
+            }
+        } catch {
+            alreadyInstalled = false;
+            break;
+        }
+    }
+
+    return { supported: true, alreadyInstalled, voiceNodePaths };
+}
+
+function shimAssetNames(): { shimSo: string; setupBin: string } {
+    const arch = process.arch; // already validated by binaryName()
+    return {
+        shimSo: `discord-capture-shim-linux-${arch}.so`,
+        setupBin: `discord-capture-setup-linux-${arch}`,
+    };
 }
 
 /**
@@ -258,24 +308,35 @@ async function initPatchcord() {
  */
 const SHIM_RELEASE_URL_BASE = PATCHCORD_RELEASE_URL_BASE;
 
-function shimAssetNames(): { shimSo: string; setupBin: string } {
-    const arch = process.arch; // already validated by binaryName()
-    return {
-        shimSo: `discord-capture-shim-linux-${arch}.so`,
-        setupBin: `discord-capture-setup-linux-${arch}`,
-    };
-}
-
 /**
- * Ensures `discord-capture-shim.so` is downloaded and DT_NEEDED'd into
- * the *currently running* Discord install's `discord_voice.node`, using
- * `discord-capture-setup` (a small companion binary, see its own doc
- * comment in ~/Code/patchcord/crates/discord-capture-shim/src/bin/setup.rs)
- * instead of shelling out to the system `patchelf` package -- this is
- * the distribution mechanism decided on this session after the
- * "dual-purpose ELF" investigation concluded a single self-patching file
- * isn't possible on glibc (PT_INTERP and dlopen/DT_NEEDED-loadability
- * are mutually exclusive on one ELF file).
+ * Downloads `discord-capture-shim.so` (checksum-verified, see
+ * downloadAsset) and DT_NEEDED's it into the *currently running*
+ * Discord install's `discord_voice.node`, using `discord-capture-setup`
+ * (a small companion binary, see its own doc comment in
+ * ~/Code/patchcord/crates/discord-capture-shim/src/bin/setup.rs) instead
+ * of shelling out to the system `patchelf` package -- this is the
+ * distribution mechanism decided on after the "dual-purpose ELF"
+ * investigation concluded a single self-patching file isn't possible on
+ * glibc (PT_INTERP and dlopen/DT_NEEDED-loadability are mutually
+ * exclusive on one ELF file).
+ *
+ * # This is a consent-gated, explicitly user-triggered action, not an
+ * automatic side effect of the plugin starting
+ *
+ * This function is exported and callable from the renderer
+ * (index.tsx), but is deliberately never called automatically anywhere
+ * in this file (in particular, NOT from initPatchcord(), which runs on
+ * every plugin start) -- an earlier version of this ran unconditionally
+ * on every plugin start with no user-visible signal at all before doing
+ * so. Patching a binary Discord itself owns, outside this plugin's own
+ * directory, on every launch, with no opt-in, is not something a
+ * reviewer (or a careful user) should be expected to accept implicitly
+ * just by enabling the plugin. index.tsx is responsible for: checking
+ * getDiscordCaptureShimStatus() first, showing an explicit confirmation
+ * (Alerts.show) describing exactly what this does before ever calling
+ * this function, and remembering the user's choice (so they aren't
+ * re-prompted every launch) rather than this file deciding on its own
+ * that the operation is welcome.
  *
  * Both downloaded files are named per-arch on the release (see
  * shimAssetNames()), same convention as patchcord's own binaryName().
@@ -288,34 +349,34 @@ function shimAssetNames(): { shimSo: string; setupBin: string } {
  *
  * Deliberately scoped to only the Discord install this plugin's own
  * process is actually running inside (see findCurrentDiscordVoiceNodePaths()),
- * not every Discord channel found on the machine -- an earlier version
- * of this scanned and silently patched every discord*-named directory
- * under the user's config root (Stable, PTB, Canary, whatever else),
- * which means installing this plugin on one channel would silently
- * modify native binaries belonging to completely separate Discord
- * installs the user never opted into touching. Scoping to the running
- * install trades a small amount of convenience (switching channels
- * means this needs to run again from within that channel, which it
- * does automatically on next plugin start) for a plugin that only ever
- * touches the one Discord install the user is actually running it in --
- * matching the same reasoning Equicord core itself uses in
+ * not every Discord channel found on the machine -- installing this
+ * plugin/consenting on one channel never touches native binaries
+ * belonging to a completely separate Discord install (Stable vs. PTB vs.
+ * Canary) the user didn't explicitly run this from. Matches the same
+ * per-install scoping Equicord core itself uses in
  * hostUpdateHook.ts's own version-dir resolution.
  *
  * Idempotent (discord-capture-setup itself no-ops on an
  * already-patched file, and always keeps a `.discord-capture-setup.orig`
  * backup of the pre-patch original -- see setup.rs's own doc comment),
- * so calling this on every plugin start is safe and cheap; it's also
- * re-run after every Discord auto-update replaces discord_voice.node
- * with a fresh, unpatched copy.
+ * so calling this again (e.g. after a Discord auto-update replaces
+ * discord_voice.node with a fresh, unpatched copy) is safe.
  */
-async function ensureDiscordCaptureShimInstalled(): Promise<void> {
-    if (process.platform !== "linux") return;
+export async function installDiscordCaptureShim(_?: Electron.IpcMainInvokeEvent): Promise<{ ok: boolean; message: string }> {
+    if (process.platform !== "linux") {
+        return { ok: false, message: "discord-capture-shim only supports Linux." };
+    }
 
     const { shimSo, setupBin } = shimAssetNames();
-    const [shimSrc, setupPath] = await Promise.all([
-        downloadAsset(shimSo, SHIM_RELEASE_URL_BASE),
-        downloadAsset(setupBin, SHIM_RELEASE_URL_BASE),
-    ]);
+    let shimSrc: string, setupPath: string;
+    try {
+        [shimSrc, setupPath] = await Promise.all([
+            downloadAsset(shimSo, SHIM_RELEASE_URL_BASE),
+            downloadAsset(setupBin, SHIM_RELEASE_URL_BASE),
+        ]);
+    } catch (e) {
+        return { ok: false, message: `Failed to download discord-capture-shim: ${(e as Error).message}` };
+    }
 
     const shimDir = binaryDir();
     const shimDest = join(shimDir, "discord-capture-shim.so");
@@ -326,19 +387,24 @@ async function ensureDiscordCaptureShimInstalled(): Promise<void> {
 
     const voiceNodePaths = await findCurrentDiscordVoiceNodePaths();
     if (voiceNodePaths.length === 0) {
-        console.warn("[patchcordAppAudio] No discord_voice.node found under the running Discord install; cannot install discord-capture-shim.");
-        return;
+        return { ok: false, message: "No discord_voice.node found under the running Discord install." };
     }
 
+    const results: string[] = [];
+    let anyFailed = false;
     for (const voiceNodePath of voiceNodePaths) {
         try {
             const { stdout } = await execFileAsync(setupPath, [voiceNodePath, shimDir]);
-            console.log(`[patchcordAppAudio] ${stdout.trim()}`);
+            results.push(stdout.trim());
         } catch (e) {
-            console.error(`[patchcordAppAudio] discord-capture-setup failed for ${voiceNodePath}`, e);
+            anyFailed = true;
+            results.push(`FAILED for ${voiceNodePath}: ${(e as Error).message}`);
         }
     }
+
+    return { ok: !anyFailed, message: results.join("\n") };
 }
+
 
 /**
  * Restores every discord_voice.node this plugin has previously patched
