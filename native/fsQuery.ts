@@ -13,6 +13,18 @@ export function getHostExecutableDir(): string {
 }
 
 /**
+ * The main process's own `process.arch`. Renderer code has no `process`
+ * global at all (Electron doesn't expose Node globals to a
+ * `nodeIntegration: false` renderer), so anything needing the host
+ * architecture -- e.g. picking which release asset to download -- has
+ * to ask main for it via this rather than reading `process.arch`
+ * directly from plugin code that also runs in the renderer.
+ */
+export function getArch(): string {
+    return process.arch;
+}
+
+/**
  * Generic path-join primitive, exposed because renderer code has no
  * `path` module of its own to build filesystem paths with (Equicord's
  * renderer/main-process split gives renderer code no Node builtins at
