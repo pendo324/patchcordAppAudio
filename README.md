@@ -16,43 +16,47 @@ music.
 ## How Discord's native Linux screenshare actually works
 
 This took real reverse-engineering to pin down, documented in detail in
-this plugin's own source comments (`index.tsx`, and Equicord core's
-`discordNativePatch.ts`). Short version: under Wayland, native Discord's
-desktop client does **not** use the standard Web `getDisplayMedia()` API
-at all. It calls straight into a native N-API addon
-(`discord_voice.node`) via `setNativeScreenSharePickerCallbacks`, which
-talks directly to `BaseCapturerPipeWire` in C++ -- confirmed via `strings`
-on the addon and extensive live testing; multiple earlier interception
-attempts on `getDisplayMedia`/`setDesktopSourceWithOptions` were tried
-and abandoned once this was understood.
+this plugin's own source comments (`index.tsx`, `preload.ts`). Short
+version: under Wayland, native Discord's desktop client does **not**
+use the standard Web `getDisplayMedia()` API at all. It calls straight
+into a native N-API addon (`discord_voice.node`) via
+`setNativeScreenSharePickerCallbacks`, which talks directly to
+`BaseCapturerPipeWire` in C++ -- confirmed via `strings` on the addon
+and extensive live testing; multiple earlier interception attempts on
+`getDisplayMedia`/`setDesktopSourceWithOptions` were tried and
+abandoned once this was understood.
 
 Because of this, and because of an unrelated but equally important
 Electron `contextBridge` quirk (`DiscordNative.nativeModules.
 requireModule(name)` returns a **fresh structured-clone every call**, so
 patching the native module from ordinary renderer code silently patches
-nothing anyone else ever sees), the actual native-module patch lives in
-Equicord core, not in this plugin:
+nothing anyone else ever sees), the actual native-module patch has to
+run in Electron's **preload** context, before contextBridge ever clones
+the native `discord_voice` module out:
 
-- **Equicord core patch** (`src/discordNativePatch.ts` + `src/preload.ts`
-  wiring, on the `patchcordAppAudio` branch of
-  [this Equicord fork](https://github.com/pendo324/Equicord)): intercepts
-  Discord's own `contextBridge.exposeInMainWorld("DiscordNative", ...)`
-  call in the **preload** context, before contextBridge ever clones the
-  native `discord_voice` module out. Patches the real, single, pre-bridge
-  object so the patch is visible everywhere, including to Discord's own
-  webpack code. Surfaces results to this plugin via plain
+- **This plugin's own `preload.ts`**: intercepts Discord's own
+  `contextBridge.exposeInMainWorld("DiscordNative", ...)` call and
+  patches the real, single, pre-bridge object so the patch is visible
+  everywhere, including to Discord's own webpack code. Surfaces results
+  to the renderer half of this plugin via plain
   `window.dispatchEvent(CustomEvent)` (DOM events aren't subject to
   contextBridge cloning -- preload and the page share one DOM/window).
-- **This plugin** (renderer-side): listens for those events, shows its
-  own picker modal, and drives the actual PipeWire routing via
-  [`patchcord`](https://github.com/pendo324/patchcord) (a native
-  `libpipewire` helper, forked from
+  Runs via Equicord core's generic per-plugin preload mechanism
+  (`src/pluginPreloads.ts`), on the `preloadPlugins` branch of
+  [this Equicord fork](https://github.com/pendo324/Equicord) -- not yet
+  merged upstream (see the "Distribution status" section below), so
+  this plugin needs that fork+branch until it lands.
+- **This plugin's renderer half** (`index.tsx`): listens for those
+  events, shows its own picker modal, and drives the actual PipeWire
+  routing via [`patchcord`](https://github.com/pendo324/patchcord) (a
+  native `libpipewire` helper, forked from
   [Milkshiift/patchcord](https://github.com/Milkshiift/patchcord) with a
   richer `RouteFilter`/multi-node `routeNodes` API this plugin depends
   on).
 
-**Both halves are required.** This plugin alone does nothing without the
-Equicord core patch also being installed.
+**Both halves are required.** This plugin alone does nothing without
+Equicord core's generic per-plugin preload mechanism also being
+present (see "Distribution status" below).
 
 ### Why not just make the virtual sink the system default?
 
@@ -69,14 +73,17 @@ completely unaffected.
 
 ### 1. Equicord core patch (required)
 
-Build Equicord from
+This plugin depends on Equicord core changes (`emitPluginNativeEvent`
+and the generic per-plugin `preload.ts` mechanism) that aren't merged
+into upstream Equicord yet -- see "Distribution status" below for the current
+status. Until they land, build Equicord from
 [`pendo324/Equicord`](https://github.com/pendo324/Equicord), branch
-`patchcordAppAudio`:
+`preloadPlugins`:
 
 ```sh
 git clone https://github.com/pendo324/Equicord
 cd Equicord
-git checkout patchcordAppAudio
+git checkout preloadPlugins
 pnpm install
 ```
 
@@ -167,6 +174,27 @@ Linux native Discord only -- this plugin no-ops everywhere else
 **To undo everything later:** `pnpm uninject` from the same `Equicord`
 folder (same interactive menu) restores Discord to stock.
 
+## Distribution status
+
+The core changes this plugin depends on
+(`emitPluginNativeEvent` -- a generic main-to-renderer push channel for
+plugin natives -- and the generic per-plugin `preload.ts` mechanism,
+`src/pluginPreloads.ts`) are written as two clean, generic,
+plugin-agnostic commits with no PatchcordAppAudio-specific code in
+Equicord core itself, specifically so they can be proposed upstream
+independently of this plugin. They currently live only on
+[`pendo324/Equicord`](https://github.com/pendo324/Equicord)'s
+`preloadPlugins` branch; no PR is open against `Equicord/Equicord` yet.
+
+Until that's merged (or a PR is at least open and reviewable), the
+`git checkout preloadPlugins` step above is the only way to get this
+plugin's preload half to work at all -- there's no way to make
+`patchcordAppAudio` function against a stock, unmodified Equicord
+install. If you want to help move this along, opening the PR upstream
+(or bugging the maintainers to review one) is the actual unblock;
+running the fork in the meantime is the correct stopgap, not a
+workaround to route around indefinitely.
+
 ## Usage
 
 Start a screenshare as normal. Once Discord's real native picker
@@ -200,9 +228,9 @@ is pre-selected next time.
 
 Discord's own "New Audio Device Detected" prompt is suppressed at the
 source for patchcord's virtual mic (filtered out of the device list
-before Discord's own detection logic ever sees it, in the Equicord core
-patch), and routing is torn down on the real "desktop source ended"
-signal, not an approximated proxy.
+before Discord's own detection logic ever sees it, in this plugin's own
+`preload.ts`), and routing is torn down on the real "desktop source
+ended" signal, not an approximated proxy.
 
 ## Architecture notes
 
@@ -217,9 +245,9 @@ signal, not an approximated proxy.
   `routeNodes(nodeIds, filter)`, returning the virtual mic's device
   description string for the renderer to match against
   `enumerateDevices()`.
-- The modal is a fully custom, DOM-only overlay (not a native `<select>`
-  -- Electron's native `<select>` popup renders via a separate OS surface
-  that doesn't compose inside Discord's frameless window, confirmed
-  non-interactable live), styled using Discord's own CSS custom
-  properties (`--background-primary` etc.) so it matches the user's
-  actual theme automatically.
+- The modal is built from Equicord's real `Modal`/`SearchableSelect`/
+  `Checkbox` components (`@webpack/common`), which resolve to Discord's
+  own internal component implementations via webpack -- not a hand-built
+  DOM overlay -- so it gets Discord's actual modal chrome, animation,
+  focus-trap, and theme/QuickCSS reactivity for free instead of
+  approximating it with hardcoded CSS variable references.

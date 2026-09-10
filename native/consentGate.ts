@@ -71,7 +71,11 @@ async function save(store: ConsentStore): Promise<void> {
     // already-valid consent ledger into something that fails to parse
     // (which would otherwise silently reset every prior grant to "not
     // consented" -- annoying, not dangerous, but avoidable for free).
-    const tmp = `${consentStorePath()}.tmp`;
+    // A unique-per-call tmp path (not a fixed name) so two overlapping
+    // save() calls -- e.g. from concurrent ensureAsset() calls -- never
+    // race on the same tmp file's rename() (one call's rename() target
+    // disappearing out from under a second call's own rename()).
+    const tmp = `${consentStorePath()}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
     await writeFile(tmp, JSON.stringify(store, null, 2));
     await rename(tmp, consentStorePath());
 }

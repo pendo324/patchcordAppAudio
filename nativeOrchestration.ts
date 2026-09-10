@@ -57,6 +57,7 @@ function makeNativeHandle(native: Native): NativeHandle {
 }
 
 let patchbay: AudioSharePatchbay | undefined;
+let ensurePatchcordInFlight: Promise<EnsurePatchcordResult> | null = null;
 
 export type EnsurePatchcordResult =
     | { ok: true; patchbay: AudioSharePatchbay }
@@ -66,19 +67,39 @@ export type EnsurePatchcordResult =
  * Ensures a patchcord process is running, starting one (consent-gated,
  * see AudioSharePatchbay.start's own doc comment) if not already. Safe
  * to call repeatedly -- reuses the existing instance.
+ *
+ * Callers routinely call this from two places in the same
+ * `Promise.all(...)` (fetchShareableNodes + fetchScreencastHint both
+ * call it independently) -- without `ensurePatchcordInFlight`, two
+ * calls landing before either's own `patchbay` assignment resolves
+ * would both see `patchbay` as unset and both proceed to download/start
+ * a second time concurrently, racing on nativeAssetStore's shared
+ * consent-ledger file (two concurrent writers to the same
+ * write-to-temp-then-rename path can have one's rename() target
+ * disappear out from under it). Caching the in-flight Promise itself
+ * (not just its eventual result) means every concurrent caller awaits
+ * the exact same single ensureAsset/start() call.
  */
-export async function ensurePatchcord(native: Native): Promise<EnsurePatchcordResult> {
-    if (patchbay) return { ok: true, patchbay };
+export function ensurePatchcord(native: Native): Promise<EnsurePatchcordResult> {
+    if (patchbay) return Promise.resolve({ ok: true, patchbay });
+    if (ensurePatchcordInFlight) return ensurePatchcordInFlight;
 
-    const instance = new AudioSharePatchbay(makeNativeHandle(native), {
-        assetName: (await assetNames(native)).patchcord,
-        releaseUrlBase: releaseUrlBase(),
-    });
-    const result = await instance.start();
-    if (!result.ok) return result;
+    ensurePatchcordInFlight = (async () => {
+        try {
+            const instance = new AudioSharePatchbay(makeNativeHandle(native), {
+                assetName: (await assetNames(native)).patchcord,
+                releaseUrlBase: releaseUrlBase(),
+            });
+            const result = await instance.start();
+            if (!result.ok) return result;
 
-    patchbay = instance;
-    return { ok: true, patchbay: instance };
+            patchbay = instance;
+            return { ok: true, patchbay: instance } as const;
+        } finally {
+            ensurePatchcordInFlight = null;
+        }
+    })();
+    return ensurePatchcordInFlight;
 }
 
 export function disposePatchcord() {
