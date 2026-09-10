@@ -69,6 +69,10 @@ export async function getHostExecutableDir(_?: Electron.IpcMainInvokeEvent) {
     return fsQuery.getHostExecutableDir();
 }
 
+export async function getArch(_?: Electron.IpcMainInvokeEvent) {
+    return fsQuery.getArch();
+}
+
 /**
  * `namePatternSource`/`namePatternFlags` rather than a `RegExp` directly
  * -- `RegExp` instances don't survive Electron's IPC structured-clone

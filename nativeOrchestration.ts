@@ -9,11 +9,18 @@ import { AudioSharePatchbay, type NativeHandle,type RouteFilter, type Screencast
 
 export type Native = PluginNative<typeof import("./native")> & PluginNativeEvents;
 
-function arch(): "x64" | "arm64" {
-    if (process.arch !== "x64" && process.arch !== "arm64") {
-        throw new Error(`patchcordAppAudio only supports x64/arm64 (got ${process.arch})`);
+/**
+ * Renderer code has no `process` global at all (Electron doesn't expose
+ * Node globals to a `nodeIntegration: false` renderer), so this asks
+ * the main process for its own `process.arch` via `native.ts` rather
+ * than reading `process.arch` directly here.
+ */
+async function arch(native: Native): Promise<"x64" | "arm64"> {
+    const a = await native.getArch();
+    if (a !== "x64" && a !== "arm64") {
+        throw new Error(`patchcordAppAudio only supports x64/arm64 (got ${a})`);
     }
-    return process.arch;
+    return a;
 }
 
 /**
@@ -33,8 +40,8 @@ export function releaseUrlBase(): string {
     return (typeof process !== "undefined" && process.env?.PATCHCORD_APP_AUDIO_RELEASE_URL_BASE) || DEFAULT_RELEASE_URL_BASE;
 }
 
-export function assetNames() {
-    const a = arch();
+export async function assetNames(native: Native) {
+    const a = await arch(native);
     return {
         patchcord: `patchcord-linux-${a}`,
         shimSo: `discord-capture-shim-linux-${a}.so`,
@@ -64,7 +71,7 @@ export async function ensurePatchcord(native: Native): Promise<EnsurePatchcordRe
     if (patchbay) return { ok: true, patchbay };
 
     const instance = new AudioSharePatchbay(makeNativeHandle(native), {
-        assetName: assetNames().patchcord,
+        assetName: (await assetNames(native)).patchcord,
         releaseUrlBase: releaseUrlBase(),
     });
     const result = await instance.start();
@@ -292,7 +299,7 @@ function toShimActionResult(r: { ok: false; reason: string;[k: string]: any }): 
 export async function installShim(native: Native): Promise<ShimActionResult> {
     if (process.platform !== "linux") return { ok: false, message: "discord-capture-shim only supports Linux." };
 
-    const { shimSo, setupBin } = assetNames();
+    const { shimSo, setupBin } = await assetNames(native);
     const url = releaseUrlBase();
 
     const shimResult = await native.ensureAsset(shimSo, url);
@@ -333,7 +340,7 @@ export async function installShim(native: Native): Promise<ShimActionResult> {
 export async function restoreShim(native: Native): Promise<ShimActionResult> {
     if (process.platform !== "linux") return { ok: false, message: "discord-capture-shim only supports Linux." };
 
-    const { setupBin } = assetNames();
+    const { setupBin } = await assetNames(native);
     const url = releaseUrlBase();
 
     const setupResult = await native.ensureAsset(setupBin, url);
