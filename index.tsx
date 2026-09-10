@@ -5,10 +5,25 @@
 
 import { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { definePluginSettings } from "@api/Settings";
+import { Paragraph } from "@components/Paragraph";
 import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType, PluginNative, PluginNativeEvents, StartAt } from "@utils/types";
+import type { RenderModalProps } from "@vencord/discord-types";
 import { onceReady } from "@webpack";
-import { Alerts, ApplicationStreamingStore, Button, Menu } from "@webpack/common";
+import {
+    Alerts,
+    ApplicationStreamingStore,
+    Button,
+    Checkbox,
+    Menu,
+    Modal,
+    openModal,
+    SearchableSelect,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+} from "@webpack/common";
 
 import * as orchestration from "./nativeOrchestration";
 
@@ -75,6 +90,23 @@ const settings = definePluginSettings({
     discordCaptureShimPromptDeclined: {
         type: OptionType.BOOLEAN,
         description: "internal: user previously declined the discord-capture-shim install prompt",
+        default: false,
+        hidden: true,
+    },
+    // Set the first time installShim() ever succeeds, and never
+    // cleared -- distinct from discordCaptureShimPromptDeclined, which
+    // only means "never asked to install it at all". A Discord
+    // auto-update can silently overwrite discord_voice.node and wipe an
+    // already-applied patch; when that happens getShimStatus() reports
+    // alreadyInstalled: false again on the next launch even though this
+    // stays true, which is exactly the signal
+    // maybePromptDiscordCaptureShimInstall uses to show a distinct
+    // "repatch needed" prompt instead of silently doing nothing (which
+    // discordCaptureShimPromptDeclined being true would otherwise cause
+    // for a user who explicitly opted in previously).
+    discordCaptureShimEverInstalled: {
+        type: OptionType.BOOLEAN,
+        description: "internal: discord-capture-shim has been successfully installed at least once",
         default: false,
         hidden: true,
     },
@@ -145,8 +177,50 @@ function nodeMatchesHint(node: ShareableNode, hint: ScreencastHint): boolean {
     return haystacks.some(h => h.includes(needle) || needle.includes(h));
 }
 
+/**
+ * Ensures patchcord is running, prompting for consent (same
+ * per-asset download-consent dialog installShim/restoreShim use) if
+ * the main patchcord binary itself needs it -- without this,
+ * ensurePatchcord's `not_consented` result was previously swallowed
+ * silently by every caller (fetchShareableNodes/fetchScreencastHint
+ * both just caught it and returned an empty result), leaving the
+ * picker permanently empty with no visible reason and no way to ever
+ * grant consent for the main binary at all.
+ *
+ * Callers (fetchShareableNodes + fetchScreencastHint) run concurrently
+ * via Promise.all, so this caches its own in-flight Promise the same
+ * way orchestration.ensurePatchcord does -- without it, both callers
+ * would independently show their own consent Alerts.show dialog at
+ * once.
+ */
+let ensurePatchcordWithConsentInFlight: Promise<orchestration.EnsurePatchcordResult> | null = null;
+function ensurePatchcordWithConsent(): Promise<orchestration.EnsurePatchcordResult> {
+    if (ensurePatchcordWithConsentInFlight) return ensurePatchcordWithConsentInFlight;
+
+    ensurePatchcordWithConsentInFlight = (async () => {
+        try {
+            let result = await orchestration.ensurePatchcord(Native);
+            result = await promptConsentAndRetry(
+                result,
+                "PatchcordAppAudio needs to download and run patchcord, the native helper that talks to " +
+                "PipeWire to list and route audio sources.",
+                () => orchestration.ensurePatchcord(Native)
+            );
+            if (!result.ok && (result as any).reason !== "not_consented") {
+                logger.error("Failed to start patchcord:", (result as any).reason, (result as any).message);
+            }
+            return result;
+        } finally {
+            ensurePatchcordWithConsentInFlight = null;
+        }
+    })();
+    return ensurePatchcordWithConsentInFlight;
+}
+
 async function fetchShareableNodes(includeDevices = false): Promise<ShareableNode[]> {
     try {
+        const ensured = await ensurePatchcordWithConsent();
+        if (!ensured.ok) return [];
         return await orchestration.listShareableNodes(Native, includeDevices);
     } catch (e) {
         logger.error("Failed to list shareable nodes", e);
@@ -156,6 +230,8 @@ async function fetchShareableNodes(includeDevices = false): Promise<ShareableNod
 
 async function fetchScreencastHint(): Promise<ScreencastHint | null> {
     try {
+        const ensured = await ensurePatchcordWithConsent();
+        if (!ensured.ok) return null;
         return await orchestration.findScreencastHint(Native);
     } catch (e) {
         logger.warn("Failed to fetch screencast hint (non-fatal)", e);
@@ -184,183 +260,6 @@ let activeSelectionNodeNames: string[] = [];
  * multi-select, there's no separate UI mode for "just one app".
  */
 type PickerMode = "none" | "apps" | "system";
-
-/**
- * Our own small overlay modal, fully independent of Discord's DOM/CSS.
- * Resolves with the chosen ShareableNode, or null for "use normal system
- * audio".
- */
-/**
- * Discord's real design-token custom properties (--background-primary,
- * --interactive-normal, --brand-experiment, etc.) are set on <html>/<body>
- * by Discord's own theme CSS and are available anywhere in the page, so
- * our overlay can just reference them directly via var() to automatically
- * match the user's actual theme (including custom themes/QuickCSS)
- * instead of hardcoding one dark-mode palette. Fallback values (after the
- * comma) keep the modal usable even if a variable is ever missing.
- */
-const DISCORD_VARS = {
-    bgPrimary: "var(--background-primary, #313338)",
-    bgSecondary: "var(--background-secondary, #2b2d31)",
-    bgSecondaryAlt: "var(--background-secondary-alt, #2b2d31)",
-    bgFloating: "var(--background-floating, #222327)",
-    bgModifierHover: "var(--background-modifier-hover, rgba(78,80,88,0.3))",
-    bgModifierSelected: "var(--background-modifier-selected, rgba(78,80,88,0.5))",
-    textNormal: "var(--text-normal, #f2f3f5)",
-    textMuted: "var(--text-muted, #949ba4)",
-    textLink: "var(--text-link, #00a8fc)",
-    interactiveNormal: "var(--interactive-normal, #b5bac1)",
-    brand: "var(--brand-experiment, #5865f2)",
-    brandHover: "var(--brand-experiment-560, #4752c4)",
-    buttonSecondaryBg: "var(--button-secondary-background, #4e5058)",
-    borderSubtle: "var(--border-subtle, rgba(255,255,255,0.06))",
-    fontPrimary: "var(--font-primary, 'gg sans', 'Noto Sans', sans-serif)",
-    fontDisplay: "var(--font-display, 'gg sans', 'Noto Sans', sans-serif)",
-    elevationHigh: "var(--elevation-high, 0 8px 16px rgba(0,0,0,0.24))",
-};
-
-/**
- * Multi-select checklist. Electron's native <select> popup renders via a
- * separate OS-level surface that doesn't compose correctly inside
- * Discord's frameless/custom-titlebar window -- confirmed live: the
- * closed <select> displayed fine, but the opened options list was
- * completely non-interactable (clicks passed through to whatever was
- * beneath it). A plain absolutely-positioned <div> list, entirely within
- * normal DOM/CSS z-stacking, has no such issue.
- *
- * Used for both "pick one or more apps to share" (item 4's Granular
- * Selection) and "pick apps to exclude from Entire System" (item 5) --
- * the only difference between those two usages is which list of nodes
- * gets passed in and how the caller interprets the resulting id set, not
- * the widget itself.
- */
-function createMultiSelect(
-    options: { value: string; label: string; disabled?: boolean; node: ShareableNode | null; }[],
-    initialValues: Set<string>,
-    initialPlaceholder: string
-) {
-    let placeholder = initialPlaceholder;
-    const root = document.createElement("div");
-    root.style.cssText = "position: relative; width: 100%;";
-
-    const trigger = document.createElement("button");
-    trigger.type = "button";
-    trigger.style.cssText = `
-        width: 100%; box-sizing: border-box; text-align: left;
-        display: flex; align-items: center; justify-content: space-between;
-        padding: 10px 12px; border-radius: 4px; border: none; cursor: pointer;
-        background: ${DISCORD_VARS.bgSecondaryAlt}; color: ${DISCORD_VARS.textNormal};
-        font-family: ${DISCORD_VARS.fontPrimary}; font-size: 14px; font-weight: 500;
-    `;
-
-    const triggerLabel = document.createElement("span");
-    triggerLabel.style.cssText = "overflow: hidden; text-overflow: ellipsis; white-space: nowrap;";
-    trigger.appendChild(triggerLabel);
-
-    const chevron = document.createElement("span");
-    chevron.textContent = "\u25be";
-    chevron.style.cssText = `color: ${DISCORD_VARS.interactiveNormal}; margin-left: 8px; flex-shrink: 0;`;
-    trigger.appendChild(chevron);
-
-    const list = document.createElement("div");
-    list.style.cssText = `
-        position: absolute; top: calc(100% + 4px); left: 0; right: 0;
-        max-height: 240px; overflow-y: auto; z-index: 10;
-        background: ${DISCORD_VARS.bgFloating}; border-radius: 8px;
-        box-shadow: ${DISCORD_VARS.elevationHigh};
-        padding: 6px; display: none;
-    `;
-
-    let currentValues = new Set(initialValues);
-    const optionEls = new Map<string, { row: HTMLDivElement; check: HTMLSpanElement; }>();
-
-    function setOpen(open: boolean) {
-        list.style.display = open ? "block" : "none";
-        chevron.textContent = open ? "\u25b4" : "\u25be";
-    }
-
-    function updateTriggerLabel() {
-        if (currentValues.size === 0) {
-            triggerLabel.textContent = placeholder;
-            return;
-        }
-        const labels = options.filter(o => currentValues.has(o.value)).map(o => o.label);
-        triggerLabel.textContent = labels.length === 1 ? labels[0] : `${labels.length} selected`;
-    }
-
-    function updateRowVisual(value: string) {
-        const entry = optionEls.get(value);
-        if (!entry) return;
-        const isSelected = currentValues.has(value);
-        entry.row.style.background = isSelected ? DISCORD_VARS.bgModifierSelected : "transparent";
-        entry.check.style.opacity = isSelected ? "1" : "0";
-    }
-
-    function toggleValue(value: string) {
-        if (currentValues.has(value)) {
-            currentValues.delete(value);
-        } else {
-            currentValues.add(value);
-        }
-        updateRowVisual(value);
-        updateTriggerLabel();
-    }
-
-    function render() {
-        list.innerHTML = "";
-        optionEls.clear();
-        for (const opt of options) {
-            const el = document.createElement("div");
-            el.style.cssText = `
-                display: flex; align-items: center; gap: 8px;
-                padding: 8px 10px; border-radius: 4px; cursor: ${opt.disabled ? "default" : "pointer"};
-                font-size: 14px; color: ${opt.disabled ? DISCORD_VARS.textMuted : DISCORD_VARS.textNormal};
-                font-style: ${opt.disabled ? "italic" : "normal"};
-            `;
-
-            const check = document.createElement("span");
-            check.textContent = "\u2713";
-            check.style.cssText = `width: 14px; flex-shrink: 0; color: ${DISCORD_VARS.brand}; opacity: 0;`;
-            el.appendChild(check);
-
-            const labelEl = document.createElement("span");
-            labelEl.textContent = opt.label;
-            labelEl.style.cssText = "overflow: hidden; text-overflow: ellipsis; white-space: nowrap;";
-            el.appendChild(labelEl);
-
-            if (!opt.disabled) {
-                el.onmouseenter = () => { if (!currentValues.has(opt.value)) el.style.background = DISCORD_VARS.bgModifierHover; };
-                el.onmouseleave = () => { if (!currentValues.has(opt.value)) el.style.background = "transparent"; };
-                el.onclick = () => toggleValue(opt.value);
-            }
-            list.appendChild(el);
-            optionEls.set(opt.value, { row: el, check });
-        }
-        for (const value of currentValues) updateRowVisual(value);
-        updateTriggerLabel();
-    }
-
-    render();
-
-    trigger.onclick = () => setOpen(list.style.display === "none");
-
-    root.appendChild(trigger);
-    root.appendChild(list);
-
-    return {
-        root,
-        getValues: () => new Set(currentValues),
-        getSelectedNodes: () => options.filter(o => currentValues.has(o.value) && o.node).map(o => o.node!),
-        setOptions: (newOptions: typeof options, values: Set<string>, newPlaceholder?: string) => {
-            options = newOptions;
-            currentValues = new Set(values);
-            if (newPlaceholder !== undefined) placeholder = newPlaceholder;
-            render();
-        },
-        close: () => setOpen(false),
-        focus: () => trigger.focus(),
-    };
-}
 
 /**
  * Result of the picker: which nodes to actually pass to patchcord's
@@ -392,25 +291,17 @@ interface PickerResult {
 /**
  * Unique key for one node in the picker's selection state.
  *
- * Previously fell back to plain `node.nodeName` when present (e.g.
- * "Firefox"), which is NOT unique -- confirmed live: every tab/window an
- * app opens shares the exact same `node.name`, so two live Firefox tabs
- * collided on the identical key, silently merging them into a single
- * selectable/toggleable entry in the multi-select (toggling one toggled
- * both, and only one was ever actually distinguishable in
- * `currentValues`). `node.id` is `ShareableNode.id`, the live PipeWire
- * registry id -- guaranteed unique among currently-live nodes, which is
- * exactly the uniqueness this key needs. It does change across process
- * restarts (a relaunched Firefox gets a fresh id), which is why
- * `nodeName` was preferred before for the "remember my last selection
- * between shares" feature to survive that -- but that goal was already
- * unachievable in exactly the multi-tab-collision case this fixes (there
- * would be no way to tell *which* remembered tab to reselect even if the
- * key did survive), so always keying by the specific live id is strictly
- * more correct: single-instance apps (Spotify, Discord's own capture,
- * etc.) still round-trip through `lastSelectedNodeNames` correctly in
- * the common case where the same node.name only ever resolves to one
- * live id at a time, and never silently merges distinct nodes together.
+ * Falls back to plain `node.nodeName` when present (e.g. "Firefox")
+ * would NOT be unique -- every tab/window an app opens shares the exact
+ * same `node.name`, so two live Firefox tabs would collide on the
+ * identical key, silently merging them into a single
+ * selectable/toggleable entry. `node.id` is `ShareableNode.id`, the live
+ * PipeWire registry id -- guaranteed unique among currently-live nodes,
+ * which is exactly the uniqueness this key needs. It does change across
+ * process restarts (a relaunched Firefox gets a fresh id), which is why
+ * `nodeName` is prepended for the "remember my last selection between
+ * shares" feature to have a chance of surviving that in the common case
+ * where the same node.name only ever resolves to one live id at a time.
  */
 function nodeKey(node: ShareableNode): string {
     return `${node.nodeName ?? node.displayName}#${node.id}`;
@@ -435,6 +326,289 @@ function nodeLabel(node: ShareableNode): string {
     return `${node.displayName} (${detail})`;
 }
 
+interface PickerOption {
+    value: string;
+    label: string;
+    disabled?: boolean;
+    node: ShareableNode | null;
+}
+
+function toOptions(list: ShareableNode[]): PickerOption[] {
+    const opts: PickerOption[] = list.map(node => ({ value: nodeKey(node), label: nodeLabel(node), node }));
+    if (list.length === 0) {
+        opts.push({
+            value: "__empty__",
+            label: "No matching audio sources found -- try Refresh once something is playing sound",
+            disabled: true,
+            node: null,
+        });
+    }
+    return opts;
+}
+
+/**
+ * The audio-picker, rendered inside a real Discord `<Modal>` instead of
+ * hand-built DOM -- gets Discord's actual modal chrome, animation,
+ * focus-trap, and escape-to-close for free, and the
+ * `SearchableSelect`/`Checkbox` components automatically track the
+ * user's live theme/QuickCSS the same way any of Discord's own dialogs
+ * do.
+ */
+function AudioPickerModal({
+    modalProps,
+    initialNodes,
+    initialHint,
+    initialMode,
+    onFinish,
+}: {
+    modalProps: RenderModalProps;
+    initialNodes: ShareableNode[];
+    initialHint: ScreencastHint | null;
+    initialMode: PickerMode;
+    onFinish: (result: PickerResult) => void;
+}) {
+    const [nodes, setNodes] = useState(initialNodes);
+    const [hint, setHint] = useState(initialHint);
+    const [mode, setMode] = useState<PickerMode>(initialMode);
+    const [filterActive, setFilterActive] = useState(initialHint != null);
+    const [refreshing, setRefreshing] = useState(false);
+    const [advancedOpen, setAdvancedOpen] = useState(false);
+    const isFirstRenderRef = useRef(true);
+    const settingsSnapshot = settings.use([
+        "deviceSelect", "ignoreDevices", "groupByApplication",
+        "onlySpeakers", "onlyDefaultSpeakers", "ignoreInputMedia", "ignoreVirtual",
+    ]);
+
+    const shareableFor = (list: ShareableNode[]) =>
+        list.filter(n => !n.isVirtual && (settingsSnapshot.deviceSelect && !settingsSnapshot.ignoreDevices ? true : !n.isDevice));
+
+    function currentAppList(): ShareableNode[] {
+        const shareable = shareableFor(nodes);
+        const matched = hint ? shareable.filter(n => nodeMatchesHint(n, hint!)) : [];
+        return filterActive && matched.length > 0 ? matched : shareable;
+    }
+
+    function preselectedValues(list: ShareableNode[]): Set<string> {
+        // The very first render, when reopened mid-stream with an active
+        // selection (initialMode === "apps"): preselect exactly what's
+        // actually routed right now, regardless of the separate
+        // "remember last selection" setting -- see
+        // activeSelectionNodeNames's own doc comment for why that
+        // setting shouldn't gate this. Only applies once; any subsequent
+        // render in this same modal (mode switches, Refresh) falls
+        // through to the normal lastSelectedNodeNames-based behavior
+        // below, unchanged from before.
+        if (isFirstRenderRef.current && initialMode === "apps" && activeSelectionNodeNames.length > 0) {
+            const keys = new Set(list.map(nodeKey));
+            return new Set(activeSelectionNodeNames.filter(n => keys.has(n)));
+        }
+        if (!settings.store.rememberLastSelection || lastSelectedNodeNames.length === 0) return new Set();
+        const keys = new Set(list.map(nodeKey));
+        return new Set(lastSelectedNodeNames.filter(n => keys.has(n)));
+    }
+
+    const listForMode = mode === "apps" ? currentAppList() : shareableFor(nodes);
+    const options = useMemo(() => toOptions(listForMode), [listForMode]);
+    const [selectedValues, setSelectedValues] = useState<string[]>(() => [...preselectedValues(listForMode)]);
+
+    // Re-derive the preselection whenever the mode (or the underlying
+    // node list) changes -- mirrors the old imperative renderList()'s
+    // multi.setOptions(..., preselected, ...) call on every mode switch
+    // and Refresh.
+    useEffect(() => {
+        setSelectedValues([...preselectedValues(listForMode)]);
+        isFirstRenderRef.current = false;
+    }, [mode, nodes]);
+
+    function computeResultNodes(): ShareableNode[] {
+        if (mode === "none") return [];
+        const selectedNodes = options.filter(o => selectedValues.includes(o.value) && o.node).map(o => o.node!);
+        if (mode === "apps") return selectedNodes;
+        // system: every currently-known shareable node minus the
+        // excluded selection. Filtering (onlySpeakers etc.) is applied
+        // server-side by patchcord's routeNodes itself, so this is
+        // deliberately the *unfiltered* candidate set, not pre-trimmed
+        // here -- see currentRouteFilter().
+        const excludedKeys = new Set(selectedNodes.map(nodeKey));
+        return shareableFor(nodes).filter(n => !excludedKeys.has(nodeKey(n)));
+    }
+
+    function finish(cancelled = false) {
+        const resultNodes = computeResultNodes();
+        if (!cancelled) {
+            // Cancel (Escape) must never touch either of these -- mode
+            // was already forced to "none" by the cancel handler purely
+            // to make computeResultNodes() return an empty result for
+            // the (unused, since cancelled=true) `nodes` field, not
+            // because anything should actually change.
+            activeSelectionNodeNames = mode === "apps" ? resultNodes.map(nodeKey) : [];
+            if (settings.store.rememberLastSelection) {
+                lastSelectedNodeNames = activeSelectionNodeNames;
+            }
+        }
+        onFinish({ mode, nodes: resultNodes, cancelled });
+        modalProps.onClose();
+    }
+
+    async function handleRefresh() {
+        if (refreshing) return;
+        setRefreshing(true);
+        try {
+            const includeDevices = settingsSnapshot.deviceSelect && !settingsSnapshot.ignoreDevices;
+            const [newNodes, newHint] = await Promise.all([
+                fetchShareableNodes(includeDevices),
+                fetchScreencastHint(),
+            ]);
+            setNodes(newNodes);
+            setHint(newHint);
+            if (newHint == null) setFilterActive(false);
+        } finally {
+            setRefreshing(false);
+        }
+    }
+
+    let description: string;
+    if (mode === "none") {
+        description = "Discord will share its normal (whole-system default) audio, same as without this plugin.";
+    } else if (mode === "apps") {
+        description =
+            "Route only the selected apps' audio into this screenshare instead of your whole system's " +
+            "default output. Pick one or more.";
+    } else {
+        description =
+            "Route your whole system's default audio into this screenshare, except the apps excluded below " +
+            "(matches Discord's usual \"Stream With Audio\" behavior, but lets you leave specific apps out).";
+    }
+
+    const shareableForHint = shareableFor(nodes);
+    const matchedForHint = hint ? shareableForHint.filter(n => nodeMatchesHint(n, hint!)) : [];
+    const showHintNotice = mode === "apps" && !!hint;
+
+    return (
+        <Modal
+            {...modalProps}
+            size="lg"
+            title="Share app audio? (patchcord)"
+            actions={[
+                { text: "Skip (normal audio)", variant: "secondary", onClick: () => { setMode("none"); finish(); } },
+                { text: "Start Sharing", variant: "primary", onClick: () => finish(false) },
+            ]}
+        >
+            <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 8 }}>
+                <Button
+                    size={Button.Sizes.SMALL}
+                    color={Button.Colors.PRIMARY}
+                    look={Button.Looks.FILLED}
+                    disabled={refreshing}
+                    onClick={() => { void handleRefresh(); }}
+                >
+                    {refreshing ? "Refreshing…" : "↻ Refresh"}
+                </Button>
+            </div>
+
+            <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+                {([
+                    { value: "none", label: "None" },
+                    { value: "apps", label: "Specific Apps" },
+                    { value: "system", label: "Entire System" },
+                ] as { value: PickerMode; label: string; }[]).map(m => (
+                    <Button
+                        key={m.value}
+                        style={{ flex: 1 }}
+                        color={mode === m.value ? Button.Colors.BRAND : Button.Colors.PRIMARY}
+                        onClick={() => setMode(m.value)}
+                    >
+                        {m.label}
+                    </Button>
+                ))}
+            </div>
+
+            <Paragraph style={{ marginBottom: 12 }}>{description}</Paragraph>
+
+            {showHintNotice && (
+                <Paragraph style={{ marginBottom: 8 }}>
+                    {filterActive && matchedForHint.length > 0 ? (
+                        <>
+                            Filtered to apps matching your shared window ("{hint!.hint}").{" "}
+                            <a href="#" onClick={e => { e.preventDefault(); setFilterActive(false); }}>
+                                Show all apps instead
+                            </a>
+                        </>
+                    ) : matchedForHint.length > 0 ? (
+                        <>
+                            Not filtering by shared window ("{hint!.hint}" match available).{" "}
+                            <a href="#" onClick={e => { e.preventDefault(); setFilterActive(true); }}>
+                                Filter to likely match
+                            </a>
+                        </>
+                    ) : (
+                        `Couldn't match any audio app to your shared window ("${hint!.hint}").`
+                    )}
+                </Paragraph>
+            )}
+
+            {mode !== "none" && (
+                <SearchableSelect
+                    placeholder={mode === "apps" ? "Select apps to share…" : "Exclude apps (optional)…"}
+                    multi
+                    options={options}
+                    value={selectedValues}
+                    onChange={v => setSelectedValues(v ?? [])}
+                    closeOnSelect={false}
+                />
+            )}
+
+            {mode === "apps" && (
+                <div style={{ marginTop: 10 }}>
+                    <Checkbox
+                        value={!!settings.store.groupByApplication}
+                        onChange={(_, v) => { settings.store.groupByApplication = v; }}
+                    >
+                        Share all tabs/windows of each picked app (not just the one selected)
+                    </Checkbox>
+                </div>
+            )}
+
+            <a
+                href="#"
+                style={{ display: "inline-block", fontSize: 12, marginTop: 12 }}
+                onClick={e => { e.preventDefault(); setAdvancedOpen(!advancedOpen); }}
+            >
+                Advanced audio filters {advancedOpen ? "▴" : "▾"}
+            </a>
+
+            {advancedOpen && (
+                <div style={{ marginTop: 8, display: "grid", gap: 8 }}>
+                    {([
+                        { key: "onlySpeakers", label: "Only Speakers" },
+                        { key: "onlyDefaultSpeakers", label: "Only Default Speakers" },
+                        { key: "ignoreInputMedia", label: "Ignore Inputs" },
+                        { key: "ignoreVirtual", label: "Ignore Virtual" },
+                        { key: "ignoreDevices", label: "Ignore Devices" },
+                        { key: "deviceSelect", label: "Device Selection" },
+                    ] as { key: "onlySpeakers" | "onlyDefaultSpeakers" | "ignoreInputMedia" | "ignoreVirtual" | "ignoreDevices" | "deviceSelect"; label: string; }[]).map(t => (
+                        <Checkbox
+                            key={t.key}
+                            value={!!settings.store[t.key]}
+                            onChange={(_, v) => { (settings.store as any)[t.key] = v; }}
+                        >
+                            {t.label}
+                        </Checkbox>
+                    ))}
+                </div>
+            )}
+        </Modal>
+    );
+}
+
+/**
+ * Opens a real Discord `<Modal>` (via `openModal`) instead of a
+ * hand-built DOM overlay -- same native chrome, animation, focus-trap,
+ * and escape-to-close as every one of Discord's own dialogs, and it
+ * automatically matches the user's live theme/QuickCSS instead of
+ * hardcoding CSS variable references. Resolves with the chosen nodes, or
+ * an empty result for "use normal system audio".
+ */
 function showAudioPickerModal(
     initialNodes: ShareableNode[],
     initialHint: ScreencastHint | null,
@@ -442,408 +616,38 @@ function showAudioPickerModal(
 ): Promise<PickerResult> {
     logger.info("showAudioPickerModal called with", initialNodes.length, "nodes, hint =", initialHint);
     return new Promise(resolve => {
-        let nodes = initialNodes;
-        let hint = initialHint;
-        let mode: PickerMode = "none";
-        let isFirstRender = true;
-        let filterActive = hint != null;
-        let refreshing = false;
-
-        const shareableFor = (list: ShareableNode[]) =>
-            list.filter(n => !n.isVirtual && (settings.store.deviceSelect && !settings.store.ignoreDevices ? true : !n.isDevice));
-
-        const overlay = document.createElement("div");
-        overlay.style.cssText = `
-            position: fixed; inset: 0; z-index: 999999;
-            background: rgba(0,0,0,0.85);
-            display: flex; align-items: center; justify-content: center;
-            font-family: ${DISCORD_VARS.fontPrimary};
-        `;
-
-        const dialog = document.createElement("div");
-        dialog.style.cssText = `
-            background: ${DISCORD_VARS.bgPrimary}; color: ${DISCORD_VARS.textNormal};
-            border-radius: 8px; padding: 24px; width: 480px; max-width: 90vw;
-            box-shadow: ${DISCORD_VARS.elevationHigh};
-        `;
-
-        const headerRow = document.createElement("div");
-        headerRow.style.cssText = "display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 8px;";
-
-        const title = document.createElement("div");
-        title.textContent = "Share app audio? (patchcord)";
-        title.style.cssText = `font-family: ${DISCORD_VARS.fontDisplay}; font-size: 20px; font-weight: 700; color: ${DISCORD_VARS.textNormal};`;
-        headerRow.appendChild(title);
-
-        const refreshBtn = document.createElement("button");
-        refreshBtn.type = "button";
-        refreshBtn.textContent = "\u21bb Refresh";
-        refreshBtn.title = "Re-scan audio sources (e.g. after starting playback in an app)";
-        refreshBtn.style.cssText = `
-            padding: 5px 10px; border-radius: 4px; border: none; cursor: pointer;
-            font-weight: 500; font-size: 12px; font-family: ${DISCORD_VARS.fontPrimary};
-            background: ${DISCORD_VARS.buttonSecondaryBg}; color: ${DISCORD_VARS.textNormal};
-            flex-shrink: 0; white-space: nowrap;
-        `;
-        headerRow.appendChild(refreshBtn);
-        dialog.appendChild(headerRow);
-
-        const description = document.createElement("div");
-        description.style.cssText = `font-size: 14px; line-height: 1.4; color: ${DISCORD_VARS.textMuted}; margin-bottom: 12px;`;
-        dialog.appendChild(description);
-
-        // --- mode switcher (item 5: None / Apps / Entire System) -------
-        const modeRow = document.createElement("div");
-        modeRow.style.cssText = "display: flex; gap: 6px; margin-bottom: 12px;";
-        const modeButtons = new Map<PickerMode, HTMLButtonElement>();
-        const MODES: { value: PickerMode; label: string; }[] = [
-            { value: "none", label: "None" },
-            { value: "apps", label: "Specific Apps" },
-            { value: "system", label: "Entire System" },
-        ];
-        for (const m of MODES) {
-            const btn = document.createElement("button");
-            btn.type = "button";
-            btn.textContent = m.label;
-            btn.style.cssText = `
-                flex: 1; padding: 8px 10px; border-radius: 4px; border: none; cursor: pointer;
-                font-weight: 500; font-size: 13px; font-family: ${DISCORD_VARS.fontPrimary};
-                transition: background 0.15s ease;
-            `;
-            btn.onclick = () => setMode(m.value);
-            modeRow.appendChild(btn);
-            modeButtons.set(m.value, btn);
-        }
-        dialog.appendChild(modeRow);
-
-        function updateModeButtonStyles() {
-            for (const [value, btn] of modeButtons) {
-                const active = value === mode;
-                btn.style.background = active ? DISCORD_VARS.brand : DISCORD_VARS.buttonSecondaryBg;
-                btn.style.color = "#fff";
-            }
+        let resolved = false;
+        function finishOnce(result: PickerResult) {
+            if (resolved) return;
+            resolved = true;
+            resolve(result);
         }
 
-        let hintNotice: HTMLDivElement | null = null;
-        if (hint) {
-            hintNotice = document.createElement("div");
-            hintNotice.style.cssText = `font-size: 12px; color: ${DISCORD_VARS.textMuted}; margin-bottom: 8px;`;
-        }
-
-        function toOptions(list: ShareableNode[]) {
-            const opts: { value: string; label: string; disabled?: boolean; node: ShareableNode | null; }[] = [];
-            for (const node of list) {
-                opts.push({ value: nodeKey(node), label: nodeLabel(node), node });
-            }
-            if (list.length === 0) {
-                opts.push({
-                    value: "__empty__",
-                    label: "No matching audio sources found -- try Refresh once something is playing sound",
-                    disabled: true,
-                    node: null,
-                });
-            }
-            return opts;
-        }
-
-        const selectContainer = document.createElement("div");
-        let multi: ReturnType<typeof createMultiSelect> | null = null;
-
-        function currentAppList(): ShareableNode[] {
-            const shareable = shareableFor(nodes);
-            const matched = hint ? shareable.filter(n => nodeMatchesHint(n, hint!)) : [];
-            return filterActive && matched.length > 0 ? matched : shareable;
-        }
-
-        function preselectedValues(list: ShareableNode[]): Set<string> {
-            // The very first render, when reopened mid-stream with an
-            // active selection (initialMode === "apps"): preselect
-            // exactly what's actually routed right now, regardless of
-            // the separate "remember last selection" setting -- see
-            // activeSelectionNodeNames's own doc comment for why that
-            // setting shouldn't gate this. Only applies once; any
-            // subsequent render in this same modal (mode switches,
-            // Refresh) falls through to the normal
-            // lastSelectedNodeNames-based behavior below, unchanged from
-            // before.
-            if (isFirstRender && initialMode === "apps" && activeSelectionNodeNames.length > 0) {
-                const keys = new Set(list.map(nodeKey));
-                return new Set(activeSelectionNodeNames.filter(n => keys.has(n)));
-            }
-            if (!settings.store.rememberLastSelection || lastSelectedNodeNames.length === 0) return new Set();
-            const keys = new Set(list.map(nodeKey));
-            return new Set(lastSelectedNodeNames.filter(n => keys.has(n)));
-        }
-
-        function updateHintNotice() {
-            if (!hintNotice || !hint || mode !== "apps") return;
-            hintNotice.textContent = "";
-            const shareable = shareableFor(nodes);
-            const matched = shareable.filter(n => nodeMatchesHint(n, hint!));
-            if (filterActive && matched.length > 0) {
-                hintNotice.append(`Filtered to apps matching your shared window ("${hint.hint}"). `);
-                const link = document.createElement("a");
-                link.href = "#";
-                link.textContent = "Show all apps instead";
-                link.style.color = DISCORD_VARS.textLink;
-                link.onclick = e => {
-                    e.preventDefault();
-                    filterActive = false;
-                    renderList();
-                };
-                hintNotice.appendChild(link);
-            } else if (matched.length > 0) {
-                hintNotice.append(`Not filtering by shared window ("${hint.hint}" match available). `);
-                const link = document.createElement("a");
-                link.href = "#";
-                link.textContent = "Filter to likely match";
-                link.style.color = DISCORD_VARS.textLink;
-                link.onclick = e => {
-                    e.preventDefault();
-                    filterActive = true;
-                    renderList();
-                };
-                hintNotice.appendChild(link);
-            } else {
-                hintNotice.append(`Couldn't match any audio app to your shared window ("${hint.hint}").`);
-            }
-        }
-
-        function renderList() {
-            selectContainer.innerHTML = "";
-
-            if (mode === "none") {
-                description.textContent = "Discord will share its normal (whole-system default) audio, same as without this plugin.";
-                if (hintNotice) hintNotice.remove();
-                groupByAppRow.style.display = "none";
-                shareBtn.textContent = "Start Sharing";
-                return;
-            }
-
-            if (mode === "apps") {
-                description.textContent =
-                    "Route only the selected apps' audio into this screenshare instead of your whole system's " +
-                    "default output. Pick one or more.";
-                const list = currentAppList();
-                const preselected = preselectedValues(list);
-                isFirstRender = false;
-                if (multi) {
-                    multi.setOptions(toOptions(list), preselected, "Select apps to share\u2026");
-                } else {
-                    multi = createMultiSelect(toOptions(list), preselected, "Select apps to share\u2026");
-                }
-                selectContainer.appendChild(multi.root);
-                if (hintNotice) {
-                    selectContainer.insertBefore(hintNotice, multi.root);
-                    updateHintNotice();
-                }
-                groupByAppRow.style.display = "flex";
-                shareBtn.textContent = "Start Sharing";
-                return;
-            }
-
-            // mode === "system"
-            description.textContent =
-                "Route your whole system's default audio into this screenshare, except the apps excluded below " +
-                "(matches Discord's usual \"Stream With Audio\" behavior, but lets you leave specific apps out).";
-            if (hintNotice) hintNotice.remove();
-            const excludable = shareableFor(nodes);
-            const preselected = preselectedValues(excludable);
-            if (multi) {
-                multi.setOptions(toOptions(excludable), preselected, "Exclude apps (optional)\u2026");
-            } else {
-                multi = createMultiSelect(toOptions(excludable), preselected, "Exclude apps (optional)\u2026");
-            }
-            selectContainer.appendChild(multi.root);
-            // "Group by application" only makes sense when picking specific
-            // apps to include -- "Entire System" mode already includes
-            // every node from every app minus the excluded ones, whether
-            // grouping is on or not (see applyAppAudioRouting's own
-            // comment on the same point).
-            groupByAppRow.style.display = "none";
-            shareBtn.textContent = "Start Sharing";
-        }
-
-        function setMode(next: PickerMode) {
-            mode = next;
-            updateModeButtonStyles();
-            renderList();
-        }
-
-        dialog.appendChild(selectContainer);
-
-        // --- "group by application" (promoted out of Advanced audio
-        // filters -- more immediately useful than the rest of that
-        // panel, and only meaningful in "apps" mode, so it's toggled
-        // visible/hidden by renderList() itself rather than hidden
-        // behind an extra click every time). --------------------------
-        const groupByAppRow = document.createElement("label");
-        groupByAppRow.style.cssText = "display: none; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; margin-top: 10px;";
-        const groupByAppCheckbox = document.createElement("input");
-        groupByAppCheckbox.type = "checkbox";
-        groupByAppCheckbox.checked = !!settings.store.groupByApplication;
-        groupByAppCheckbox.onchange = () => {
-            settings.store.groupByApplication = groupByAppCheckbox.checked;
-        };
-        groupByAppRow.appendChild(groupByAppCheckbox);
-        const groupByAppLabel = document.createElement("span");
-        groupByAppLabel.textContent = "Share all tabs/windows of each picked app (not just the one selected)";
-        groupByAppLabel.style.color = DISCORD_VARS.textNormal;
-        groupByAppRow.appendChild(groupByAppLabel);
-        dialog.appendChild(groupByAppRow);
-
-        // --- advanced filters (item 4: granular/device selection + the
-        // rest of patchcord's RouteFilter) -------------------------------
-        const advancedToggle = document.createElement("a");
-        advancedToggle.href = "#";
-        advancedToggle.textContent = "Advanced audio filters \u25be";
-        advancedToggle.style.cssText = `display: inline-block; font-size: 12px; color: ${DISCORD_VARS.textLink}; margin-top: 12px;`;
-        dialog.appendChild(advancedToggle);
-
-        const advancedPanel = document.createElement("div");
-        advancedPanel.style.cssText = "display: none; margin-top: 8px; display: grid; gap: 8px;";
-        advancedPanel.style.display = "none";
-        dialog.appendChild(advancedPanel);
-
-        const ADVANCED_TOGGLES: { key: "onlySpeakers" | "onlyDefaultSpeakers" | "ignoreInputMedia" | "ignoreVirtual" | "ignoreDevices" | "deviceSelect"; label: string; }[] = [
-            { key: "onlySpeakers", label: "Only Speakers" },
-            { key: "onlyDefaultSpeakers", label: "Only Default Speakers" },
-            { key: "ignoreInputMedia", label: "Ignore Inputs" },
-            { key: "ignoreVirtual", label: "Ignore Virtual" },
-            { key: "ignoreDevices", label: "Ignore Devices" },
-            { key: "deviceSelect", label: "Device Selection" },
-        ];
-        for (const t of ADVANCED_TOGGLES) {
-            const row = document.createElement("label");
-            row.style.cssText = "display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;";
-            const checkbox = document.createElement("input");
-            checkbox.type = "checkbox";
-            checkbox.checked = !!settings.store[t.key];
-            checkbox.onchange = () => {
-                (settings.store as any)[t.key] = checkbox.checked;
-                renderList();
-            };
-            row.appendChild(checkbox);
-            const label = document.createElement("span");
-            label.textContent = t.label;
-            label.style.color = DISCORD_VARS.textNormal;
-            row.appendChild(label);
-            advancedPanel.appendChild(row);
-        }
-
-        let advancedOpen = false;
-        advancedToggle.onclick = e => {
-            e.preventDefault();
-            advancedOpen = !advancedOpen;
-            advancedPanel.style.display = advancedOpen ? "grid" : "none";
-            advancedToggle.textContent = advancedOpen ? "Advanced audio filters \u25b4" : "Advanced audio filters \u25be";
-        };
-
-        const buttonRow = document.createElement("div");
-        buttonRow.style.cssText = "display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px;";
-
-        function makeButton(text: string, primary: boolean): HTMLButtonElement {
-            const btn = document.createElement("button");
-            btn.type = "button";
-            btn.textContent = text;
-            btn.style.cssText = `
-                padding: 9px 16px; border-radius: 4px; border: none; cursor: pointer;
-                font-weight: 500; font-size: 14px; font-family: ${DISCORD_VARS.fontPrimary};
-                background: ${primary ? DISCORD_VARS.brand : DISCORD_VARS.buttonSecondaryBg};
-                color: #fff; transition: background 0.15s ease;
-            `;
-            btn.onmouseenter = () => { btn.style.background = primary ? DISCORD_VARS.brandHover : DISCORD_VARS.bgModifierHover; };
-            btn.onmouseleave = () => { btn.style.background = primary ? DISCORD_VARS.brand : DISCORD_VARS.buttonSecondaryBg; };
-            return btn;
-        }
-
-        function computeResultNodes(): ShareableNode[] {
-            if (mode === "none") return [];
-            if (mode === "apps") return multi?.getSelectedNodes() ?? [];
-            // system: every currently-known shareable node minus the
-            // excluded selection. Filtering (onlySpeakers etc.) is applied
-            // server-side by patchcord's routeNodes itself, so this is
-            // deliberately the *unfiltered* candidate set, not
-            // pre-trimmed here -- see currentRouteFilter().
-            const excludedKeys = new Set((multi?.getSelectedNodes() ?? []).map(nodeKey));
-            return shareableFor(nodes).filter(n => !excludedKeys.has(nodeKey(n)));
-        }
-
-        function finish(cancelled = false) {
-            const resultNodes = computeResultNodes();
-            if (!cancelled) {
-                // Cancel (Escape) must never touch either of these --
-                // mode was already forced to "none" by the Escape
-                // handler purely to make computeResultNodes() return an
-                // empty result for the (unused, since cancelled=true)
-                // `nodes` field, not because anything should actually
-                // change.
-                activeSelectionNodeNames = mode === "apps" ? resultNodes.map(nodeKey) : [];
-                if (settings.store.rememberLastSelection) {
-                    lastSelectedNodeNames = activeSelectionNodeNames;
-                }
-            }
-            overlay.remove();
-            document.removeEventListener("keydown", onKeydown, true);
-            resolve({ mode, nodes: resultNodes, cancelled });
-        }
-
-        const shareBtn = makeButton("Start Sharing", true);
-        shareBtn.onclick = () => finish(false);
-
-        const skipBtn = makeButton("Skip (normal audio)", false);
-        skipBtn.onclick = () => {
-            mode = "none";
-            finish();
-        };
-
-        refreshBtn.onclick = async () => {
-            if (refreshing) return;
-            refreshing = true;
-            const prevText = refreshBtn.textContent;
-            refreshBtn.textContent = "Refreshing\u2026";
-            refreshBtn.disabled = true;
-            try {
-                const includeDevices = settings.store.deviceSelect && !settings.store.ignoreDevices;
-                const [newNodes, newHint] = await Promise.all([
-                    fetchShareableNodes(includeDevices),
-                    fetchScreencastHint(),
-                ]);
-                nodes = newNodes;
-                hint = newHint;
-                if (hint == null) filterActive = false;
-                renderList();
-            } finally {
-                refreshing = false;
-                refreshBtn.textContent = prevText;
-                refreshBtn.disabled = false;
-            }
-        };
-
-        buttonRow.appendChild(skipBtn);
-        buttonRow.appendChild(shareBtn);
-        dialog.appendChild(buttonRow);
-
-        overlay.appendChild(dialog);
-        document.body.appendChild(overlay);
-        logger.info("Audio picker overlay appended to document.body. body.contains(overlay):", document.body.contains(overlay), "overlay rect:", overlay.getBoundingClientRect());
-
-        function onKeydown(e: KeyboardEvent) {
-            if (e.key === "Escape") { multi?.close(); mode = "none"; finish(true); }
-        }
-        document.addEventListener("keydown", onKeydown, true);
-
-        setMode(initialMode);
+        openModal(modalProps => (
+            <AudioPickerModal
+                modalProps={modalProps}
+                initialNodes={initialNodes}
+                initialHint={initialHint}
+                initialMode={initialMode}
+                onFinish={finishOnce}
+            />
+        ), {
+            onCloseRequest: () => {
+                // Escape (or clicking the backdrop): leave the current
+                // selection alone, distinct from an explicit "Skip"
+                // click -- see PickerResult.cancelled's own doc comment.
+                finishOnce({ mode: "none", nodes: [], cancelled: true });
+            },
+        });
     });
 }
 
 /**
  * Actually applies app-audio routing once the user has picked one or more
- * nodes from our overlay modal: links those nodes' audio directly into
+ * nodes from the picker modal: links those nodes' audio directly into
  * every live `discord_capture` node -- Discord's own native per-app
- * screenshare-audio capture, confirmed this session (via a real
- * disconnect/reconnect test against a live viewer) to be the actual
- * audio path "Stream With Audio" uses. This requires
+ * screenshare-audio capture, the actual audio path "Stream With Audio"
+ * uses. This requires
  * `discord-capture-shim` (a separate LD_PRELOAD native library, not part
  * of this plugin -- see its own README) to be installed, which strips
  * Discord's own auto-linking properties from each `discord_capture`
@@ -1077,11 +881,36 @@ function onDesktopSourceEndedEvent(_ev: Event) {
  * other plugins already use to answer "is the current user streaming
  * right now" (see equicordplugins/whosWatching), so it should reliably
  * catch every case desktopSourceEnded doesn't.
+ *
+ * `getCurrentUserActiveStream()` transiently returns falsy on plain
+ * guild/channel navigation while a share is genuinely still ongoing --
+ * observed live, repeatedly, switching channels mid-share fires this
+ * store's change event with a momentarily-empty active stream before it
+ * settles back to the real one. Debounced: only actually tears down
+ * routing if the falsy state is still there after a short grace period,
+ * and the pending teardown is cancelled if the store reports an active
+ * stream again before that fires -- a real "Stop Streaming" (or any
+ * other genuine end) stays falsy well past the debounce window, so this
+ * doesn't meaningfully delay a real teardown.
  */
+const APPLICATION_STREAMING_STORE_DEBOUNCE_MS = 1500;
+let applicationStreamingDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
 function onApplicationStreamingStoreChange() {
-    if (!ApplicationStreamingStore.getCurrentUserActiveStream()) {
-        handleDesktopSourceEnded();
+    if (ApplicationStreamingStore.getCurrentUserActiveStream()) {
+        if (applicationStreamingDebounceTimer) {
+            clearTimeout(applicationStreamingDebounceTimer);
+            applicationStreamingDebounceTimer = null;
+        }
+        return;
     }
+    if (applicationStreamingDebounceTimer) return;
+    applicationStreamingDebounceTimer = setTimeout(() => {
+        applicationStreamingDebounceTimer = null;
+        if (!ApplicationStreamingStore.getCurrentUserActiveStream()) {
+            handleDesktopSourceEnded();
+        }
+    }, APPLICATION_STREAMING_STORE_DEBOUNCE_MS);
 }
 
 function patchDiscordVoice() {
@@ -1116,6 +945,10 @@ function unpatchDiscordVoice() {
     // added is a documented no-op for Flux stores) or if
     // ApplicationStreamingStore still isn't populated for some reason.
     ApplicationStreamingStore?.removeChangeListener(onApplicationStreamingStoreChange);
+    if (applicationStreamingDebounceTimer) {
+        clearTimeout(applicationStreamingDebounceTimer);
+        applicationStreamingDebounceTimer = null;
+    }
     if (cleanupCurrentRouting) {
         try {
             cleanupCurrentRouting();
@@ -1233,6 +1066,7 @@ async function runInstallDiscordCaptureShim() {
 
     if (result.ok) {
         logger.info("discord-capture-shim installed:", (result as any).message);
+        settings.store.discordCaptureShimEverInstalled = true;
         Alerts.show({
             title: "Audio capture shim installed",
             body: <p>Per-app audio sharing is now active. You may need to restart Discord for this to take full effect.</p>,
@@ -1297,14 +1131,21 @@ function RestoreShimButton() {
  * trigger. This first prompt is about whether the user wants the
  * feature at all; the second is the actual native-code-execution
  * consent gate. Checks getShimStatus() first (read-only) so a user who
- * already installed it, or whose platform doesn't support it, is never
- * asked. Declining sets discordCaptureShimPromptDeclined so this
- * specific prompt doesn't reappear every launch -- the "Install audio
- * capture shim" settings button remains available regardless.
+ * already has it installed, or whose platform doesn't support it, is
+ * never asked.
+ *
+ * A user who previously declined this offer entirely
+ * (discordCaptureShimPromptDeclined) is never shown *this* prompt again
+ * -- but if they'd previously opted in and successfully installed it at
+ * least once (discordCaptureShimEverInstalled), and getShimStatus() now
+ * reports it's no longer installed, that means a Discord auto-update
+ * silently overwrote discord_voice.node and wiped the patch. That case
+ * shows a distinct "reinstall needed" prompt instead, regardless of the
+ * unrelated decline flag -- someone who already chose to use this
+ * feature should keep being offered to keep it working, not silently
+ * lose it on the next Discord update.
  */
 async function maybePromptDiscordCaptureShimInstall() {
-    if (settings.store.discordCaptureShimPromptDeclined) return;
-
     let status: orchestration.ShimStatus;
     try {
         status = await orchestration.getShimStatus(Native);
@@ -1313,6 +1154,25 @@ async function maybePromptDiscordCaptureShimInstall() {
         return;
     }
     if (!status.supported || status.alreadyInstalled) return;
+
+    if (settings.store.discordCaptureShimEverInstalled) {
+        Alerts.show({
+            title: "Audio capture component needs reinstalling",
+            body: (
+                <p>
+                    A Discord update replaced <code>discord_voice.node</code>, which removed the
+                    discord-capture-shim patch this plugin previously installed. Reinstall it to restore
+                    per-app screenshare audio -- your existing backup and consent settings are unaffected.
+                </p>
+            ),
+            confirmText: "Reinstall",
+            cancelText: "Not now",
+            onConfirm: () => { void runInstallDiscordCaptureShim(); },
+        });
+        return;
+    }
+
+    if (settings.store.discordCaptureShimPromptDeclined) return;
 
     Alerts.show({
         title: "Install audio capture component?",
