@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import { IS_LINUX } from "@utils/constants";
 import type { PluginNative, PluginNativeEvents } from "@utils/types";
 
 import { AudioSharePatchbay, type NativeHandle,type RouteFilter, type ScreencastHint, type ShareableNode } from "./patchcordClient";
@@ -283,7 +284,7 @@ export interface ShimStatus {
 
 /** Read-only: does not download or execute anything (one plain file read per discord_voice.node found). */
 export async function getShimStatus(native: Native): Promise<ShimStatus> {
-    if (process.platform !== "linux") return { supported: false, alreadyInstalled: false, voiceNodePaths: [] };
+    if (!IS_LINUX) return { supported: false, alreadyInstalled: false, voiceNodePaths: [] };
 
     const voiceNodePaths = await findDiscordVoiceNodePaths(native);
     if (voiceNodePaths.length === 0) return { supported: true, alreadyInstalled: false, voiceNodePaths: [] };
@@ -318,7 +319,7 @@ function toShimActionResult(r: { ok: false; reason: string;[k: string]: any }): 
  * `native.recordConsent`, then call this again.
  */
 export async function installShim(native: Native): Promise<ShimActionResult> {
-    if (process.platform !== "linux") return { ok: false, message: "discord-capture-shim only supports Linux." };
+    if (!IS_LINUX) return { ok: false, message: "discord-capture-shim only supports Linux." };
 
     const { shimSo, setupBin } = await assetNames(native);
     const url = releaseUrlBase();
@@ -359,7 +360,7 @@ export async function installShim(native: Native): Promise<ShimActionResult> {
 
 /** Restores every discord_voice.node this plugin has previously patched back to its pre-patch original. */
 export async function restoreShim(native: Native): Promise<ShimActionResult> {
-    if (process.platform !== "linux") return { ok: false, message: "discord-capture-shim only supports Linux." };
+    if (!IS_LINUX) return { ok: false, message: "discord-capture-shim only supports Linux." };
 
     const { setupBin } = await assetNames(native);
     const url = releaseUrlBase();

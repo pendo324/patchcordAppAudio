@@ -6,6 +6,7 @@
 import { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { definePluginSettings } from "@api/Settings";
 import { Paragraph } from "@components/Paragraph";
+import { IS_LINUX } from "@utils/constants";
 import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType, PluginNative, PluginNativeEvents, StartAt } from "@utils/types";
 import type { RenderModalProps } from "@vencord/discord-types";
@@ -1218,7 +1219,30 @@ export default definePlugin({
     startAt: StartAt.Init,
 
     start() {
-        if (!IS_DISCORD_DESKTOP || process.platform !== "linux") {
+        // Renderer code has no bare `process` global (an Electron
+        // renderer-isolation change -- confirmed live via CDP against a
+        // newly-updated Discord 1.0.158: `typeof process === "undefined"`
+        // even though it apparently worked before on 1.0.156, likely only
+        // because an earlier esbuild config for this specific expression
+        // string happened to get literal-substituted at build time and
+        // stopped once Discord's own build tooling/flags changed --
+        // exactly the same root cause as nativeOrchestration.ts's arch()
+        // ReferenceError fixed earlier this project. A first attempt at
+        // fixing this used `DiscordNative.process.platform` (the pattern
+        // every other Equicord renderer-side check uses), but that threw
+        // `ReferenceError: DiscordNative is not defined` here specifically
+        // -- confirmed live: this plugin runs at StartAt.Init (needed so
+        // its connection-factory patch installs before Discord's own
+        // webpack code grabs the original references -- see startAt's
+        // own comment below), which is *before* preload's
+        // contextBridge.exposeInMainWorld("DiscordNative", ...) call has
+        // run, so window.DiscordNative doesn't exist yet at this specific
+        // point in startup. navigator.platform (via Equicord's IS_LINUX,
+        // see src/utils/constants.ts) is populated by the browser engine
+        // itself before any application JS runs at all, so it has no such
+        // ordering dependency and is what every other Equicord Init-stage
+        // platform check should arguably use too.
+        if (!IS_DISCORD_DESKTOP || !IS_LINUX) {
             logger.warn("PatchcordAppAudio only applies to native Discord desktop on Linux; not patching.");
             return;
         }
