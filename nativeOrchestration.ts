@@ -26,7 +26,7 @@ async function arch(native: Native): Promise<"x64" | "arm64"> {
 
 /**
  * Points at a specific tagged release rather than `/releases/latest/
- * download`: the current release is a prerelease (`v0.1.0-rc.1`), and
+ * download`: the current release is a prerelease (`v0.1.0-rc.2`), and
  * GitHub's `/latest` alias only ever resolves to the newest *non*
  * prerelease -- it 404s while every published release is a prerelease.
  * Bump this tag when a new release is cut.
@@ -36,7 +36,7 @@ async function arch(native: Native): Promise<"x64" | "arm64"> {
  * downloadable asset is fetched from -- used for local testing against
  * a throwaway HTTP server serving freshly-built binaries.
  */
-const DEFAULT_RELEASE_URL_BASE = "https://github.com/pendo324/patchcord/releases/download/v0.1.0-rc.1";
+const DEFAULT_RELEASE_URL_BASE = "https://github.com/pendo324/patchcord/releases/download/v0.1.0-rc.2";
 export function releaseUrlBase(): string {
     return (typeof process !== "undefined" && process.env?.PATCHCORD_APP_AUDIO_RELEASE_URL_BASE) || DEFAULT_RELEASE_URL_BASE;
 }
